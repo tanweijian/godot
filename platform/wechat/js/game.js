@@ -169,19 +169,7 @@ function godotWeChatProbeWebGL2() {
 }
 
 function godotWeChatReadPackageFile(path) {
-	return new Promise(function (resolve, reject) {
-		var fs = wx.getFileSystemManager();
-		fs.readFile({
-			filePath: path,
-			success: function (result) {
-				resolve(result.data);
-			},
-			fail: function (error) {
-				var detail = error && error.errMsg ? error.errMsg : error;
-				reject(new Error("Could not read packaged file \"" + path + "\": " + detail + ". If the file is in a subpackage, load that subpackage before starting the engine, and keep ignoreDevUnusedFiles disabled."));
-			},
-		});
-	});
+	return WeChatHost.createPackageAccess(wx.getFileSystemManager()).readAsync(path);
 }
 
 function godotWeChatLoadRuntimeSubpackage() {
@@ -370,8 +358,12 @@ function godotWeChatStartEngine() {
 			godotPoolSize: 1,
 			focusCanvas: false,
 		});
-		var ready = module.initFS ? module.initFS([]) : Promise.resolve();
-		return Promise.resolve(ready).then(function () {
+		godotWeChatRoot().GodotWeChatFiles = WeChatHost.createGodotFiles(typeof wx !== "undefined" ? wx : null);
+		var ready = module.initFS ? module.initFS(WeChatHost.userDataMounts()) : Promise.resolve();
+		return Promise.resolve(ready).then(function (fsError) {
+			if (fsError) {
+				console.error("[Godot] user:// persistence is unavailable: " + (fsError.message || fsError));
+			}
 			return module;
 		});
 	}).then(function (module) {

@@ -116,6 +116,9 @@ def shell_contract_markers() -> list[str]:
         "godotWeChatCompareVersion",
         "--main-pack",
         'require("./wechat_host_model.js")',
+        "createGodotFiles",
+        "userDataMounts",
+        "createPackageAccess",
     ]
 
 

@@ -84,6 +84,15 @@ Error FileAccessUnix::open_internal(const String &p_path, int p_mode_flags) {
 		return ERR_INVALID_PARAMETER;
 	}
 
+#ifdef WECHAT_ENABLED
+	// Exported res:// data is served from the read-only pack. A filesystem
+	// write would create a loose file that the pack still shadows on read.
+	if ((p_mode_flags & WRITE) && get_access_type() == ACCESS_RESOURCES) {
+		last_error = ERR_FILE_NO_PERMISSION;
+		ERR_FAIL_V_MSG(ERR_FILE_NO_PERMISSION, vformat("Cannot write \"%s\". Packaged res:// resources are read-only in a WeChat Mini Game.", p_path));
+	}
+#endif
+
 	/* pretty much every implementation that uses fopen as primary
 	   backend (unix-compatible mostly) supports utf8 encoding */
 

@@ -1,8 +1,11 @@
 /**
- * WeChat window, touch, and lifecycle mapping.
+ * WeChat window, touch, lifecycle, and file mapping.
  *
  * Touch conversion matches Godot's web input path: CSS pixels in, canvas
  * buffer pixels out. Safe area uses that same buffer pixel space.
+ *
+ * Packaged code-package files stay read-only. user:// is the Godot /userfs
+ * mount persisted under the WeChat user-data directory.
  */
 "use strict";
 
@@ -588,10 +591,658 @@ function createHost() {
 	return host;
 }
 
+var USER_DATA_MOUNT = "/userfs";
+
+function userDataMounts() {
+	return [USER_DATA_MOUNT];
+}
+
+function errorDetail(error) {
+	if (!error) {
+		return "unknown file error";
+	}
+	if (typeof error === "string") {
+		return error;
+	}
+	if (error.errMsg) {
+		return String(error.errMsg);
+	}
+	if (error.message) {
+		return String(error.message);
+	}
+	return String(error);
+}
+
+function fileFailure(action, path, error, errorName) {
+	var message = "[Godot] " + action + " failed for \"" + path + "\": " + errorDetail(error) + " (" + errorName + ")";
+	console.error(message);
+	return { ok: false, error: errorName, message: message };
+}
+
+function isMissingFileError(error) {
+	var text = errorDetail(error).toLowerCase();
+	return text.indexOf("no such file") >= 0 || text.indexOf("not found") >= 0 || text.indexOf("not exist") >= 0;
+}
+
+function classifyFileError(action, path, error) {
+	var text = errorDetail(error).toLowerCase();
+	var errorName = "FAILED";
+	if (text.indexOf("no such file") >= 0 || text.indexOf("not found") >= 0 || text.indexOf("not exist") >= 0) {
+		errorName = "ERR_FILE_NOT_FOUND";
+	} else if (text.indexOf("already exist") >= 0 || text.indexOf("file exists") >= 0) {
+		errorName = "ERR_ALREADY_EXISTS";
+	} else if (text.indexOf("permission") >= 0 || text.indexOf("denied") >= 0 || text.indexOf("read only") >= 0 || text.indexOf("read-only") >= 0) {
+		errorName = "ERR_FILE_NO_PERMISSION";
+	} else if (text.indexOf("storage limit") >= 0 || text.indexOf("maximum size") >= 0 || text.indexOf("no space") >= 0 || text.indexOf("quota") >= 0) {
+		errorName = "ERR_FILE_CANT_WRITE";
+	} else if (action === "read") {
+		errorName = "ERR_FILE_CANT_READ";
+	} else if (action === "write") {
+		errorName = "ERR_FILE_CANT_WRITE";
+	} else if (action === "mkdir") {
+		errorName = "ERR_CANT_CREATE";
+	}
+	if (errorName === "ERR_ALREADY_EXISTS") {
+		return { ok: false, error: errorName, message: errorDetail(error) };
+	}
+	return fileFailure(action, path, error, errorName);
+}
+
+function isDirectoryStat(stat) {
+	if (!stat) {
+		return false;
+	}
+	if (typeof stat.isDirectory === "function") {
+		return !!stat.isDirectory();
+	}
+	if (typeof stat.isDirectory === "boolean") {
+		return stat.isDirectory;
+	}
+	if (typeof stat.mode === "number") {
+		return (stat.mode & 61440) === 16384;
+	}
+	return false;
+}
+
+function toBytes(data) {
+	if (data == null) {
+		return new Uint8Array(0);
+	}
+	if (data instanceof Uint8Array) {
+		return new Uint8Array(data);
+	}
+	if (data instanceof ArrayBuffer) {
+		return new Uint8Array(data);
+	}
+	if (ArrayBuffer.isView(data)) {
+		return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+	}
+	if (typeof data === "string") {
+		var encoded = new Uint8Array(data.length);
+		for (var i = 0; i < data.length; i++) {
+			encoded[i] = data.charCodeAt(i) & 255;
+		}
+		return encoded;
+	}
+	if (Array.isArray(data)) {
+		return new Uint8Array(data);
+	}
+	return new Uint8Array(0);
+}
+
+function cleanRelative(path) {
+	if (path == null) {
+		return null;
+	}
+	var parts = String(path).split("/");
+	var clean = [];
+	for (var i = 0; i < parts.length; i++) {
+		if (parts[i] === "" || parts[i] === ".") {
+			continue;
+		}
+		if (parts[i] === "..") {
+			return null;
+		}
+		clean.push(parts[i]);
+	}
+	return clean.join("/");
+}
+
+function parentRelative(path) {
+	var index = path.lastIndexOf("/");
+	if (index < 0) {
+		return "";
+	}
+	return path.slice(0, index);
+}
+
+function joinHostPath(root, child) {
+	if (!child) {
+		return root;
+	}
+	if (root.charAt(root.length - 1) === "/") {
+		root = root.slice(0, -1);
+	}
+	if (child.charAt(0) === "/") {
+		return root + child;
+	}
+	return root + "/" + child;
+}
+
+function engineErrno(errorName) {
+	if (errorName === "ERR_FILE_NOT_FOUND") {
+		return 44;
+	}
+	if (errorName === "ERR_FILE_NO_PERMISSION") {
+		return 69;
+	}
+	if (errorName === "ERR_ALREADY_EXISTS") {
+		return 20;
+	}
+	if (errorName === "ERR_FILE_BAD_PATH") {
+		return 28;
+	}
+	if (errorName === "ERR_FILE_CANT_WRITE") {
+		return 51;
+	}
+	return 29;
+}
+
+function relativeToMount(mountPoint, fullPath) {
+	if (fullPath === mountPoint) {
+		return "";
+	}
+	var prefix = mountPoint.charAt(mountPoint.length - 1) === "/" ? mountPoint : mountPoint + "/";
+	if (fullPath.indexOf(prefix) !== 0) {
+		return null;
+	}
+	return cleanRelative(fullPath.slice(prefix.length));
+}
+
+function createUserDataStore(hostFs, userDataPath) {
+	var base = String(userDataPath || "");
+	while (base.charAt(base.length - 1) === "/") {
+		base = base.slice(0, -1);
+	}
+	var root = base + "/godot/userfs";
+
+	function hostPath(relative) {
+		return relative ? root + "/" + relative : root;
+	}
+
+	function ensureDir(relative) {
+		var cleaned = cleanRelative(relative);
+		if (cleaned == null) {
+			return fileFailure("mkdir", relative, "path escapes the user data directory", "ERR_FILE_BAD_PATH");
+		}
+		var target = hostPath(cleaned);
+		try {
+			var stat = hostFs.statSync(target);
+			if (isDirectoryStat(stat)) {
+				return { ok: true, error: "ERR_ALREADY_EXISTS" };
+			}
+			return fileFailure("mkdir", cleaned || root, "path is not a directory", "ERR_CANT_CREATE");
+		} catch (error) {
+			if (!isMissingFileError(error)) {
+				return classifyFileError("mkdir", cleaned || root, error);
+			}
+		}
+		var parent = parentRelative(cleaned);
+		if (cleaned && parent !== cleaned) {
+			var made = ensureDir(parent);
+			if (!made.ok) {
+				return made;
+			}
+		}
+		try {
+			hostFs.mkdirSync(target, true);
+			return { ok: true };
+		} catch (error) {
+			var failed = classifyFileError("mkdir", cleaned || root, error);
+			if (failed.error === "ERR_ALREADY_EXISTS") {
+				return { ok: true, error: "ERR_ALREADY_EXISTS" };
+			}
+			return failed;
+		}
+	}
+
+	function write(relative, data) {
+		var cleaned = cleanRelative(relative);
+		if (cleaned == null || cleaned === "") {
+			return fileFailure("write", relative, "path escapes the user data directory", "ERR_FILE_BAD_PATH");
+		}
+		var parent = parentRelative(cleaned);
+		var made = ensureDir(parent);
+		if (!made.ok) {
+			return made;
+		}
+		try {
+			var bytes = toBytes(data);
+			hostFs.writeFileSync(hostPath(cleaned), bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+			return { ok: true };
+		} catch (error) {
+			return classifyFileError("write", cleaned, error);
+		}
+	}
+
+	function read(relative) {
+		var cleaned = cleanRelative(relative);
+		if (cleaned == null || cleaned === "") {
+			return fileFailure("read", relative, "path escapes the user data directory", "ERR_FILE_BAD_PATH");
+		}
+		try {
+			return { ok: true, data: toBytes(hostFs.readFileSync(hostPath(cleaned))) };
+		} catch (error) {
+			return classifyFileError("read", cleaned, error);
+		}
+	}
+
+	function remove(relative) {
+		var cleaned = cleanRelative(relative);
+		if (cleaned == null || cleaned === "") {
+			return fileFailure("remove", relative, "path escapes the user data directory", "ERR_FILE_BAD_PATH");
+		}
+		try {
+			hostFs.unlinkSync(hostPath(cleaned));
+			return { ok: true };
+		} catch (error) {
+			return classifyFileError("remove", cleaned, error);
+		}
+	}
+
+	function removeDir(relative) {
+		var cleaned = cleanRelative(relative);
+		if (cleaned == null || cleaned === "") {
+			return fileFailure("remove", relative, "cannot remove the user data root", "ERR_FILE_NO_PERMISSION");
+		}
+		try {
+			hostFs.rmdirSync(hostPath(cleaned));
+			return { ok: true };
+		} catch (error) {
+			return classifyFileError("remove", cleaned, error);
+		}
+	}
+
+	function rename(fromRelative, toRelative) {
+		var from = cleanRelative(fromRelative);
+		var to = cleanRelative(toRelative);
+		if (from == null || to == null || from === "" || to === "") {
+			return fileFailure("rename", String(fromRelative) + " -> " + String(toRelative), "path escapes the user data directory", "ERR_FILE_BAD_PATH");
+		}
+		var made = ensureDir(parentRelative(to));
+		if (!made.ok) {
+			return made;
+		}
+		try {
+			hostFs.renameSync(hostPath(from), hostPath(to));
+			return { ok: true };
+		} catch (error) {
+			return classifyFileError("rename", from + " -> " + to, error);
+		}
+	}
+
+	function list(relative) {
+		var cleaned = cleanRelative(relative);
+		if (cleaned == null) {
+			return fileFailure("list", relative, "path escapes the user data directory", "ERR_FILE_BAD_PATH");
+		}
+		try {
+			var names = hostFs.readdirSync(hostPath(cleaned));
+			var entries = [];
+			for (var i = 0; i < names.length; i++) {
+				if (names[i] === "." || names[i] === "..") {
+					continue;
+				}
+				var child = cleaned ? cleaned + "/" + names[i] : names[i];
+				var stat = hostFs.statSync(hostPath(child));
+				entries.push({ name: names[i], directory: isDirectoryStat(stat) });
+			}
+			entries.sort(function (left, right) {
+				return left.name < right.name ? -1 : left.name > right.name ? 1 : 0;
+			});
+			return { ok: true, entries: entries };
+		} catch (error) {
+			return classifyFileError("list", cleaned || root, error);
+		}
+	}
+
+	function load() {
+		var prepared = ensureDir("");
+		if (!prepared.ok) {
+			return prepared;
+		}
+		var dirs = [];
+		var files = [];
+		function walk(relative) {
+			var listed = list(relative);
+			if (!listed.ok) {
+				return listed;
+			}
+			for (var i = 0; i < listed.entries.length; i++) {
+				var entry = listed.entries[i];
+				var child = relative ? relative + "/" + entry.name : entry.name;
+				if (entry.directory) {
+					dirs.push(child);
+					var nested = walk(child);
+					if (nested) {
+						return nested;
+					}
+				} else {
+					var contents = read(child);
+					if (!contents.ok) {
+						return contents;
+					}
+					files.push({ path: child, data: contents.data });
+				}
+			}
+			return null;
+		}
+		var failed = walk("");
+		if (failed) {
+			return failed;
+		}
+		return { ok: true, dirs: dirs, files: files };
+	}
+
+	return {
+		makeDir: function (relative) {
+			var result = ensureDir(relative);
+			if (result.ok) {
+				return { ok: true };
+			}
+			return result;
+		},
+		write: write,
+		read: read,
+		remove: remove,
+		removeDir: removeDir,
+		rename: rename,
+		list: list,
+		load: load,
+	};
+}
+
+function createPackageAccess(hostFs) {
+	function rejectWrite(action, path) {
+		return fileFailure(action, path, "code package resources are read-only in a WeChat Mini Game", "ERR_FILE_NO_PERMISSION");
+	}
+
+	function readFailure(path, error) {
+		var detail = errorDetail(error);
+		if (detail.indexOf("subpackage") < 0) {
+			detail += " If the file is in a subpackage, load that subpackage before starting the engine, and keep ignoreDevUnusedFiles disabled.";
+		}
+		return classifyFileError("read", path, detail);
+	}
+
+	function read(path) {
+		try {
+			return { ok: true, data: toBytes(hostFs.readFileSync(path)) };
+		} catch (error) {
+			return readFailure(path, error);
+		}
+	}
+
+	return {
+		read: read,
+		readAsync: function (path) {
+			if (hostFs && typeof hostFs.readFile === "function") {
+				return new Promise(function (resolve, reject) {
+					hostFs.readFile({
+						filePath: path,
+						success: function (result) {
+							resolve(toBytes(result && result.data));
+						},
+						fail: function (error) {
+							reject(new Error(readFailure(path, error).message));
+						},
+					});
+				});
+			}
+			var syncResult = read(path);
+			if (!syncResult.ok) {
+				return Promise.reject(new Error(syncResult.message));
+			}
+			return Promise.resolve(syncResult.data);
+		},
+		write: function (path) {
+			return rejectWrite("write", path);
+		},
+		remove: function (path) {
+			return rejectWrite("remove", path);
+		},
+		rename: function (path) {
+			return rejectWrite("rename", path);
+		},
+		makeDir: function (path) {
+			return rejectWrite("mkdir", path);
+		},
+	};
+}
+
+function snapshotNode(FS, node) {
+	if (FS && FS.filesystems && FS.filesystems.MEMFS && FS.filesystems.MEMFS.getFileDataAsTypedArray) {
+		return new Uint8Array(FS.filesystems.MEMFS.getFileDataAsTypedArray(node));
+	}
+	var size = node && node.usedBytes ? node.usedBytes : 0;
+	var bytes = new Uint8Array(size);
+	if (!node || !node.contents || !size) {
+		return bytes;
+	}
+	if (node.contents.subarray) {
+		bytes.set(node.contents.subarray(0, size));
+		return bytes;
+	}
+	for (var i = 0; i < size; i++) {
+		bytes[i] = node.contents[i];
+	}
+	return bytes;
+}
+
+function restoreNode(node, bytes) {
+	node.contents = bytes;
+	node.usedBytes = bytes.length;
+}
+
+function mountUserData(FS, store, mountPoint) {
+	var populating = false;
+
+	function throwResult(result) {
+		throw new FS.ErrnoError(engineErrno(result.error));
+	}
+
+	function nodePath(node) {
+		if (FS.getPath) {
+			return FS.getPath(node);
+		}
+		return node && node.path ? node.path : "";
+	}
+
+	var filesystem = {
+		mount: function (mount) {
+			var node = FS.filesystems.MEMFS.mount(mount);
+			if (!node.path) {
+				node.path = mount.mountpoint || mountPoint;
+			}
+			var memfsNodeOps = node.node_ops;
+			node.node_ops = Object.assign({}, memfsNodeOps);
+			node.node_ops.mknod = function (parent, name, mode, dev) {
+				var full = nodePath(parent) + "/" + name;
+				var relative = relativeToMount(mountPoint, full);
+				if (!populating && relative && !FS.isDir(mode)) {
+					var createdOnHost = store.write(relative, new Uint8Array(0));
+					if (!createdOnHost.ok) {
+						throwResult(createdOnHost);
+					}
+				}
+				var created = memfsNodeOps.mknod(parent, name, mode, dev);
+				created.node_ops = node.node_ops;
+				created.path = full;
+				created.memfs_stream_ops = created.stream_ops;
+				created.stream_ops = Object.assign({}, created.stream_ops);
+				created.stream_ops.write = function (stream, buffer, offset, length, position, canOwn) {
+					var previous = snapshotNode(FS, stream.node);
+					var written = created.memfs_stream_ops.write(stream, buffer, offset, length, position, canOwn);
+					if (populating) {
+						return written;
+					}
+					var filePath = stream.path || nodePath(stream.node);
+					var fileRelative = relativeToMount(mountPoint, filePath);
+					if (fileRelative == null) {
+						return written;
+					}
+					var persisted = store.write(fileRelative, snapshotNode(FS, stream.node));
+					if (!persisted.ok) {
+						restoreNode(stream.node, previous);
+						throwResult(persisted);
+					}
+					return written;
+				};
+				if (created.memfs_stream_ops && created.memfs_stream_ops.close) {
+					created.stream_ops.close = function (stream) {
+						return created.memfs_stream_ops.close(stream);
+					};
+				}
+				return created;
+			};
+			node.node_ops.mkdir = function (parent, name) {
+				var full = nodePath(parent) + "/" + name;
+				var relative = relativeToMount(mountPoint, full);
+				if (!populating && relative) {
+					var made = store.makeDir(relative);
+					if (!made.ok) {
+						throwResult(made);
+					}
+				}
+				var created = memfsNodeOps.mkdir(parent, name);
+				created.node_ops = node.node_ops;
+				created.path = full;
+				return created;
+			};
+			node.node_ops.unlink = function (parent, name) {
+				var full = nodePath(parent) + "/" + name;
+				var relative = relativeToMount(mountPoint, full);
+				if (!populating && relative) {
+					var removed = store.remove(relative);
+					if (!removed.ok && removed.error !== "ERR_FILE_NOT_FOUND") {
+						throwResult(removed);
+					}
+				}
+				return memfsNodeOps.unlink(parent, name);
+			};
+			node.node_ops.rmdir = function (parent, name) {
+				var full = nodePath(parent) + "/" + name;
+				var relative = relativeToMount(mountPoint, full);
+				if (!populating && relative) {
+					var removed = store.removeDir(relative);
+					if (!removed.ok) {
+						throwResult(removed);
+					}
+				}
+				return memfsNodeOps.rmdir(parent, name);
+			};
+			node.node_ops.rename = function (oldNode, newDir, newName) {
+				var from = nodePath(oldNode);
+				var to = nodePath(newDir) + "/" + newName;
+				var fromRelative = relativeToMount(mountPoint, from);
+				var toRelative = relativeToMount(mountPoint, to);
+				if (!populating && fromRelative && toRelative) {
+					var renamed = store.rename(fromRelative, toRelative);
+					if (!renamed.ok) {
+						throwResult(renamed);
+					}
+				}
+				return memfsNodeOps.rename(oldNode, newDir, newName);
+			};
+			if (memfsNodeOps.setattr) {
+				node.node_ops.setattr = function (target, attr) {
+					var previous = snapshotNode(FS, target);
+					memfsNodeOps.setattr(target, attr);
+					if (populating || !attr || typeof attr.size !== "number") {
+						return;
+					}
+					var relative = relativeToMount(mountPoint, nodePath(target));
+					if (!relative) {
+						return;
+					}
+					var persisted = store.write(relative, snapshotNode(FS, target));
+					if (!persisted.ok) {
+						restoreNode(target, previous);
+						throwResult(persisted);
+					}
+				};
+			}
+			return node;
+		},
+	};
+
+	FS.mkdirTree(mountPoint);
+	FS.mount(filesystem, {}, mountPoint);
+	populating = true;
+	var loaded = store.load();
+	if (!loaded.ok) {
+		populating = false;
+		return loaded;
+	}
+	for (var dirIndex = 0; dirIndex < loaded.dirs.length; dirIndex++) {
+		FS.mkdirTree(mountPoint + "/" + loaded.dirs[dirIndex]);
+	}
+	for (var fileIndex = 0; fileIndex < loaded.files.length; fileIndex++) {
+		var file = loaded.files[fileIndex];
+		var enginePath = mountPoint + "/" + file.path;
+		var slash = enginePath.lastIndexOf("/");
+		if (slash > 0) {
+			FS.mkdirTree(enginePath.slice(0, slash));
+		}
+		FS.writeFile(enginePath, file.data);
+	}
+	populating = false;
+	return { ok: true };
+}
+
+function createGodotFiles(wx) {
+	var userDataPath = wx && wx.env && typeof wx.env.USER_DATA_PATH === "string" ? wx.env.USER_DATA_PATH : "";
+	var manager = wx && typeof wx.getFileSystemManager === "function" ? wx.getFileSystemManager() : null;
+	var available = !!(userDataPath && manager);
+	var store = available ? createUserDataStore(manager, userDataPath) : null;
+	return {
+		isAvailable: function () {
+			return available;
+		},
+		init: function (FS, godotFS, paths) {
+			if (!available) {
+				return new Error("WeChat user data directory is unavailable. user:// saves will not persist. wx.env.USER_DATA_PATH and wx.getFileSystemManager() are required.");
+			}
+			if (!Array.isArray(paths) || !paths.length) {
+				return null;
+			}
+			for (var i = 0; i < paths.length; i++) {
+				var mounted = mountUserData(FS, store, paths[i]);
+				if (!mounted.ok) {
+					try {
+						FS.unmount(paths[i]);
+					} catch (error) {
+						// The mount did not complete.
+					}
+					return new Error(mounted.message || "Could not load WeChat user data.");
+				}
+			}
+			return null;
+		},
+		sync: function () {
+			return null;
+		},
+		deinit: function () {},
+	};
+}
+
 var api = {
 	bufferSize: bufferSize,
 	changedTouchEvent: changedTouchEvent,
+	createGodotFiles: createGodotFiles,
 	createHost: createHost,
+	createPackageAccess: createPackageAccess,
+	createUserDataStore: createUserDataStore,
 	cssRect: cssRect,
 	diagnoseRendererMessage: diagnoseRendererMessage,
 	metricsFromInfo: metricsFromInfo,
@@ -601,6 +1252,7 @@ var api = {
 	safeAreaPixels: safeAreaPixels,
 	samplePerformance: samplePerformance,
 	touchToGodot: touchToGodot,
+	userDataMounts: userDataMounts,
 };
 
 if (typeof module === "object" && module && module.exports) {

@@ -52,6 +52,16 @@
 #include <mntent.h>
 #endif
 
+#ifdef WECHAT_ENABLED
+static Error _wechat_resource_mutation_error(DirAccess::AccessType p_access, const String &p_path) {
+	if (p_access != DirAccess::ACCESS_RESOURCES) {
+		return OK;
+	}
+	ERR_PRINT(vformat("Cannot modify \"%s\". Packaged res:// resources are read-only in a WeChat Mini Game.", p_path));
+	return ERR_FILE_NO_PERMISSION;
+}
+#endif
+
 Error DirAccessUnix::list_dir_begin() {
 	list_dir_end(); //close any previous dir opening!
 
@@ -316,6 +326,13 @@ bool DirAccessUnix::drives_are_shortcuts() {
 Error DirAccessUnix::make_dir(String p_dir) {
 	GLOBAL_LOCK_FUNCTION
 
+#ifdef WECHAT_ENABLED
+	Error wechat_err = _wechat_resource_mutation_error(get_access_type(), p_dir);
+	if (wechat_err != OK) {
+		return wechat_err;
+	}
+#endif
+
 	if (p_dir.is_relative_path()) {
 		p_dir = get_current_dir().path_join(p_dir);
 	}
@@ -395,6 +412,12 @@ String DirAccessUnix::get_current_dir(bool p_include_drive) const {
 }
 
 Error DirAccessUnix::rename(String p_path, String p_new_path) {
+#ifdef WECHAT_ENABLED
+	Error wechat_err = _wechat_resource_mutation_error(get_access_type(), p_path);
+	if (wechat_err != OK) {
+		return wechat_err;
+	}
+#endif
 	if (p_path.is_relative_path()) {
 		p_path = get_current_dir().path_join(p_path);
 	}
@@ -427,6 +450,12 @@ Error DirAccessUnix::rename(String p_path, String p_new_path) {
 }
 
 Error DirAccessUnix::remove(String p_path) {
+#ifdef WECHAT_ENABLED
+	Error wechat_err = _wechat_resource_mutation_error(get_access_type(), p_path);
+	if (wechat_err != OK) {
+		return wechat_err;
+	}
+#endif
 	if (p_path.is_relative_path()) {
 		p_path = get_current_dir().path_join(p_path);
 	}
@@ -495,6 +524,12 @@ String DirAccessUnix::read_link(String p_file) {
 }
 
 Error DirAccessUnix::create_link(String p_source, String p_target) {
+#ifdef WECHAT_ENABLED
+	Error wechat_err = _wechat_resource_mutation_error(get_access_type(), p_target);
+	if (wechat_err != OK) {
+		return wechat_err;
+	}
+#endif
 	if (p_target.is_relative_path()) {
 		p_target = get_current_dir().path_join(p_target);
 	}

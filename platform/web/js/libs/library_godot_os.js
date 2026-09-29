@@ -120,10 +120,21 @@ const GodotFS = {
 		ENOENT: 44,
 		_idbfs: false,
 		_syncing: false,
+		_backend: '',
 		_mount_points: [],
 
 		is_persistent: function () {
 			return GodotFS._idbfs ? 1 : 0;
+		},
+
+		// WeChat game.js installs this on GameGlobal before initFS. Web exports leave it unset.
+		_wechatFiles: function () {
+			const root = typeof GameGlobal !== 'undefined' ? GameGlobal : (typeof globalThis !== 'undefined' ? globalThis : null);
+			const files = root && root.GodotWeChatFiles;
+			if (!files || typeof files.isAvailable !== 'function' || !files.isAvailable()) {
+				return null;
+			}
+			return files;
 		},
 
 		// Initialize godot file system, setting up persistent paths.
@@ -132,11 +143,36 @@ const GodotFS = {
 		// since emscripten is not doing it by itself. (emscripten GH#12516).
 		init: function (persistentPaths) {
 			GodotFS._idbfs = false;
+			GodotFS._backend = '';
 			if (!Array.isArray(persistentPaths)) {
 				return Promise.reject(new Error('Persistent paths must be an array'));
 			}
 			if (!persistentPaths.length) {
 				return Promise.resolve();
+			}
+			const wechat = GodotFS._wechatFiles();
+			if (wechat) {
+				try {
+					const failure = wechat.init(FS, GodotFS, persistentPaths);
+					if (failure) {
+						GodotFS._mount_points = [];
+						GodotRuntime.error(failure.message || String(failure));
+						return Promise.resolve(failure);
+					}
+					GodotFS._backend = 'wechat';
+					GodotFS._idbfs = true;
+					GodotFS._mount_points = persistentPaths.slice();
+					return Promise.resolve();
+				} catch (error) {
+					GodotFS._mount_points = [];
+					GodotRuntime.error(`WeChat user data is not available: ${error && error.message ? error.message : error}`);
+					return Promise.resolve(error);
+				}
+			}
+			if (typeof wx !== 'undefined' && wx) {
+				const message = 'WeChat user data directory is unavailable. user:// saves will not persist. wx.env.USER_DATA_PATH and wx.getFileSystemManager() are required.';
+				GodotRuntime.error(message);
+				return Promise.resolve(new Error(message));
 			}
 			GodotFS._mount_points = persistentPaths.slice();
 
@@ -172,23 +208,50 @@ const GodotFS = {
 
 		// Deinit godot file system, making sure to unmount file systems, and close IDBFS(s).
 		deinit: function () {
+			const wechatBackend = GodotFS._backend === 'wechat';
 			GodotFS._mount_points.forEach(function (path) {
 				try {
 					FS.unmount(path);
 				} catch (e) {
 					GodotRuntime.print('Already unmounted', e);
 				}
-				if (GodotFS._idbfs && IDBFS.dbs[path]) {
+				if (!wechatBackend && GodotFS._idbfs && IDBFS.dbs[path]) {
 					IDBFS.dbs[path].close();
 					delete IDBFS.dbs[path];
 				}
 			});
+			if (wechatBackend) {
+				const wechat = GodotFS._wechatFiles();
+				if (wechat && wechat.deinit) {
+					wechat.deinit();
+				}
+			}
 			GodotFS._mount_points = [];
 			GodotFS._idbfs = false;
 			GodotFS._syncing = false;
+			GodotFS._backend = '';
 		},
 
 		sync: function () {
+			if (GodotFS._backend === 'wechat') {
+				if (GodotFS._syncing) {
+					GodotRuntime.error('Already syncing!');
+					return Promise.resolve();
+				}
+				GodotFS._syncing = true;
+				const wechat = GodotFS._wechatFiles();
+				let failure = null;
+				try {
+					failure = wechat ? wechat.sync(FS, GodotFS) : new Error('WeChat user data disappeared during sync');
+				} catch (error) {
+					failure = error;
+				}
+				GodotFS._syncing = false;
+				if (failure) {
+					GodotRuntime.error(`Failed to save WeChat user data: ${failure.message || failure}`);
+				}
+				return Promise.resolve(failure);
+			}
 			if (GodotFS._syncing) {
 				GodotRuntime.error('Already syncing!');
 				return Promise.resolve();
