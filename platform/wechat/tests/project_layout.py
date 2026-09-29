@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HEADER = ROOT / "wechat_project_layout.h"
 SHELL = ROOT / "js" / "game.js"
+HOST_MODEL = ROOT / "js" / "wechat_host_model.js"
 
 
 def _header_string(name: str) -> str:
@@ -67,6 +68,7 @@ def plan_project(appid: str, godot_orientation: int, shell_without: int, shell_w
         return {"valid": False, "error": "4 MB"}
     main_files = [
         "game.js",
+        "wechat_host_model.js",
         "game.json",
         "project.config.json",
         "project.private.config.json",
@@ -109,4 +111,18 @@ def shell_contract_markers() -> list[str]:
         "getContext(\"webgl2\")",
         "godotWeChatCompareVersion",
         "--main-pack",
+        'require("./wechat_host_model.js")',
+    ]
+
+
+def host_contract_markers() -> list[str]:
+    return [
+        "onTouchStart",
+        "onTouchMove",
+        "onTouchEnd",
+        "onTouchCancel",
+        "onHide",
+        "onShow",
+        "onWindowResize",
+        "safeArea",
     ]

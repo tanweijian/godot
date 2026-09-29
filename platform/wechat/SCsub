@@ -32,10 +32,11 @@ build_env.AddJSLibraries(
         "#platform/web/js/libs/library_godot_runtime.js",
         "#platform/web/js/libs/library_godot_input.js",
         "#platform/web/js/libs/library_godot_webgl2.js",
+        "#platform/wechat/js/library_godot_wechat.js",
     ]
 )
 build_env.AddJSExterns(["#platform/web/js/libs/library_godot_webgl2.externs.js"])
-build_env.AddJSPost(["#platform/web/js/patches/patch_em_gl.js"])
+build_env.AddJSPost(["#platform/web/js/patches/patch_em_gl.js", "#platform/wechat/js/patch_wechat_document.js"])
 build_env.AddJSPre(["#platform/wechat/js/wechat_host_bridge.js"])
 if env["javascript_eval"]:
     build_env.AddJSLibraries(["#platform/web/js/libs/library_godot_javascript_singleton.js"])
@@ -113,6 +114,7 @@ in_files = [
     build[0],
     wasm_br,
     "#platform/wechat/js/game.js",
+    "#platform/wechat/js/wechat_host_model.js",
     "#platform/wechat/js/runtime_game.js",
     "#platform/web/js/libs/audio.worklet.js",
     "#platform/web/js/libs/audio.position.worklet.js",
@@ -122,6 +124,7 @@ out_files = [
     zip_dir.File("godot.js"),
     zip_dir.File("godot.wasm.br"),
     zip_dir.File("game.js"),
+    zip_dir.File("wechat_host_model.js"),
     zip_dir.File("runtime_game.js"),
     zip_dir.File("godot.audio.worklet.js"),
     zip_dir.File("godot.audio.position.worklet.js"),

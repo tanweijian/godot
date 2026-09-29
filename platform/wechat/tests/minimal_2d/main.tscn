@@ -1,6 +1,9 @@
 [gd_scene format=3 uid="uid://wechatbootscene"]
 
+[ext_resource type="Script" path="res://main.gd" id="1_main"]
+
 [node name="Main" type="Node2D"]
+script = ExtResource("1_main")
 
 [node name="Panel" type="Polygon2D" parent="."]
 color = Color(0.15, 0.55, 0.35, 1)

@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 from project_layout import (
+    HOST_MODEL,
     MIN_BASE_LIBRARY,
     PREVIEW_APPID,
     RUNTIME_SUBPACKAGE_NAME,
@@ -152,6 +153,7 @@ def assemble(destination: Path) -> dict:
         "runtimeFiles": plan["runtime_files"],
     }
     _write(destination / "game.js", shell)
+    shutil.copyfile(HOST_MODEL, destination / "wechat_host_model.js")
     _write(destination / "game.json", json.dumps(game, indent=2) + "\n")
     _write(destination / "project.config.json", json.dumps(project_config, indent=2) + "\n")
     _write(destination / "project.private.config.json", json.dumps({"libVersion": "latest", "setting": {"urlCheck": False, "ignoreDevUnusedFiles": False}}, indent=2) + "\n")

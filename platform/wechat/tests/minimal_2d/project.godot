@@ -11,6 +11,8 @@ run/main_scene="res://main.tscn"
 
 window/size/viewport_width=480
 window/size/viewport_height=854
+window/stretch/mode="canvas_items"
+window/stretch/aspect="keep"
 window/handheld/orientation=1
 
 [rendering]

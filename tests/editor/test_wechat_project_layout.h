@@ -71,6 +71,7 @@ TEST_CASE("[WeChat] Engine runtime stays in the main package when it fits") {
 	CHECK(plan.project_appid == "touristappid");
 	CHECK(plan.device_orientation == "portrait");
 	CHECK(plan.main_files.has("godot.wasm"));
+	CHECK(plan.main_files.has("wechat_host_model.js"));
 	CHECK(plan.runtime_files.is_empty());
 }
 

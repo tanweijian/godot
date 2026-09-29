@@ -468,9 +468,10 @@ Error EditorExportPlatformWeChat::export_project(const Ref<EditorExportPreset> &
 	unzClose(pkg);
 
 	const String shell_template = _read_text(staging.path_join("game.js"));
+	const String host_model = _read_text(staging.path_join("wechat_host_model.js"));
 	const String wasm_name = FileAccess::exists(staging.path_join("godot.wasm.br")) ? String("godot.wasm.br") : String("godot.wasm");
-	if (shell_template.is_empty() || !FileAccess::exists(staging.path_join(wasm_name)) || !FileAccess::exists(staging.path_join("godot.js"))) {
-		add_message(EXPORT_MESSAGE_ERROR, TTR("Prepare Templates"), TTR("WeChat template must contain game.js, godot.js, and godot.wasm or godot.wasm.br."));
+	if (shell_template.is_empty() || host_model.is_empty() || !FileAccess::exists(staging.path_join(wasm_name)) || !FileAccess::exists(staging.path_join("godot.js"))) {
+		add_message(EXPORT_MESSAGE_ERROR, TTR("Prepare Templates"), TTR("WeChat template must contain game.js, wechat_host_model.js, godot.js, and godot.wasm or godot.wasm.br."));
 		return ERR_FILE_CORRUPT;
 	}
 
@@ -526,8 +527,11 @@ Error EditorExportPlatformWeChat::export_project(const Ref<EditorExportPreset> &
 	without_sub.use_runtime_subpackage = false;
 	WeChatProjectLayout::Plan with_sub = without_sub;
 	with_sub.use_runtime_subpackage = true;
-	const ShellTexts shell_without = _build_shell(shell_template, without_sub, safe_name, orientation, revision, emscripten_version, wasm_name);
-	const ShellTexts shell_with = _build_shell(shell_template, with_sub, safe_name, orientation, revision, emscripten_version, wasm_name);
+	ShellTexts shell_without = _build_shell(shell_template, without_sub, safe_name, orientation, revision, emscripten_version, wasm_name);
+	ShellTexts shell_with = _build_shell(shell_template, with_sub, safe_name, orientation, revision, emscripten_version, wasm_name);
+	const int64_t host_model_bytes = host_model.utf8().length();
+	shell_without.bytes += host_model_bytes;
+	shell_with.bytes += host_model_bytes;
 	const WeChatProjectLayout::Plan plan = WeChatProjectLayout::plan_project(appid, orientation, shell_without.bytes, shell_with.bytes, runtime_files);
 	if (!plan.valid) {
 		add_message(EXPORT_MESSAGE_ERROR, TTR("Export"), plan.error);
@@ -536,6 +540,7 @@ Error EditorExportPlatformWeChat::export_project(const Ref<EditorExportPreset> &
 	const ShellTexts shell = plan.use_runtime_subpackage ? shell_with : shell_without;
 
 	if (_write_text(project_dir.path_join("game.js"), shell.game_js) != OK ||
+			_write_text(project_dir.path_join("wechat_host_model.js"), host_model) != OK ||
 			_write_text(project_dir.path_join("game.json"), shell.game_json) != OK ||
 			_write_text(project_dir.path_join("project.config.json"), shell.project_config) != OK ||
 			_write_text(project_dir.path_join("project.private.config.json"), shell.private_config) != OK ||

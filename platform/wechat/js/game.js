@@ -12,6 +12,19 @@ var GODOT_PCK_PATH = ___GODOT_PCK_PATH___;
 var GODOT_REVISION = ___GODOT_REVISION___;
 var GODOT_EMSCRIPTEN = ___GODOT_EMSCRIPTEN_VERSION___;
 var GODOT_PROJECT_NAME = ___GODOT_PROJECT_NAME___;
+var WeChatHost = require("./wechat_host_model.js");
+
+function godotWeChatRoot() {
+	return typeof GameGlobal !== "undefined" ? GameGlobal : (typeof window !== "undefined" ? window : globalThis);
+}
+
+function godotWeChatHost() {
+	var root = godotWeChatRoot();
+	if (!root.GodotWeChatHost) {
+		root.GodotWeChatHost = WeChatHost.createHost();
+	}
+	return root.GodotWeChatHost;
+}
 
 function godotWeChatFail(title, message) {
 	var text = "[Godot] " + title + ": " + message;
@@ -74,57 +87,16 @@ function godotWeChatSdkVersion() {
 }
 
 function godotWeChatApplyWindowMetrics() {
-	var info = {};
-	try {
-		if (wx.getWindowInfo) {
-			info = wx.getWindowInfo() || {};
-		} else if (wx.getSystemInfoSync) {
-			info = wx.getSystemInfoSync() || {};
-		}
-	} catch (error) {
-		console.error("[Godot] Could not read window size: " + error);
-	}
-	var width = info.windowWidth || info.screenWidth || 480;
-	var height = info.windowHeight || info.screenHeight || 854;
-	var ratio = info.pixelRatio || 1;
-	var root = typeof GameGlobal !== "undefined" ? GameGlobal : window;
-	root.devicePixelRatio = ratio;
-	root.innerWidth = width;
-	root.innerHeight = height;
-	root.screen = {
-		width: info.screenWidth || width,
-		height: info.screenHeight || height,
-		availWidth: info.screenWidth || width,
-		availHeight: info.screenHeight || height,
-	};
-	return { width: width, height: height, ratio: ratio };
+	var root = godotWeChatRoot();
+	var info = WeChatHost.readWindowInfo(typeof wx !== "undefined" ? wx : null);
+	return godotWeChatHost().applyInfo(root, info);
 }
 
-function godotWeChatPrepareCanvas(metrics) {
+function godotWeChatPrepareCanvas() {
 	var canvas = wx.createCanvas();
-	canvas.id = "canvas";
-	canvas.width = Math.max(1, Math.floor(metrics.width * metrics.ratio));
-	canvas.height = Math.max(1, Math.floor(metrics.height * metrics.ratio));
-	if (!canvas.style) {
-		canvas.style = {};
-	}
-	if (typeof canvas.addEventListener !== "function") {
-		canvas.addEventListener = function () {};
-	}
-	if (typeof canvas.removeEventListener !== "function") {
-		canvas.removeEventListener = function () {};
-	}
-	if (typeof canvas.focus !== "function") {
-		canvas.focus = function () {};
-	}
-	if (typeof canvas.getBoundingClientRect !== "function") {
-		canvas.getBoundingClientRect = function () {
-			return { left: 0, top: 0, width: canvas.width, height: canvas.height, right: canvas.width, bottom: canvas.height };
-		};
-	}
-	var root = typeof GameGlobal !== "undefined" ? GameGlobal : window;
+	var root = godotWeChatRoot();
 	root.__godotWeChatCanvas = canvas;
-	return canvas;
+	return godotWeChatHost().prepareCanvas(canvas);
 }
 
 function godotWeChatProbeWebGL2() {
@@ -234,6 +206,12 @@ function godotWeChatEnsureDocument() {
 		},
 	};
 	root.document = doc;
+	try {
+		document = doc;
+	} catch (error) {
+		// WeChat may expose a non-assignable document. The engine patch
+		// looks up the canvas from GameGlobal when that happens.
+	}
 	if (typeof window === "object") {
 		window.document = doc;
 	}
@@ -383,8 +361,9 @@ function godotWeChatBoot() {
 		);
 		return;
 	}
-	var metrics = godotWeChatApplyWindowMetrics();
-	godotWeChatPrepareCanvas(metrics);
+	godotWeChatApplyWindowMetrics();
+	godotWeChatPrepareCanvas();
+	godotWeChatHost().bind(godotWeChatRoot(), wx);
 	if (!godotWeChatProbeWebGL2()) {
 		return;
 	}

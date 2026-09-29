@@ -8,14 +8,71 @@
  */
 (function () {
 	var root = typeof GameGlobal !== "undefined" ? GameGlobal : (typeof globalThis !== "undefined" ? globalThis : this);
-	if (typeof document === "object" && document && typeof document.querySelector !== "function") {
-		document.querySelector = function (selector) {
-			var canvas = root.__godotWeChatCanvas;
-			return selector === "#canvas" || selector === "canvas" ? canvas : null;
+	if (typeof root.Blob !== "function") {
+		function WeChatBlob(parts, options) {
+			this._parts = parts || [];
+			this.type = options && options.type ? options.type : "";
+			this.size = 0;
+		}
+		WeChatBlob.prototype.slice = function () {
+			return new WeChatBlob([], { type: this.type });
 		};
-			document.getElementById = function (id) {
-			return id === "canvas" ? root.__godotWeChatCanvas : null;
+		WeChatBlob.prototype.arrayBuffer = function () {
+			return Promise.resolve(new ArrayBuffer(0));
 		};
+		WeChatBlob.prototype.text = function () {
+			return Promise.resolve("");
+		};
+		root.Blob = WeChatBlob;
+	}
+	if (typeof root.URL !== "function" && typeof root.URL !== "object") {
+		root.URL = {};
+	}
+	function tolerateObjectURL(urlObject) {
+		if (!urlObject) {
+			return;
+		}
+		var nativeCreateObjectURL = urlObject.createObjectURL;
+		urlObject.createObjectURL = function (obj) {
+			try {
+				if (typeof nativeCreateObjectURL === "function") {
+					return nativeCreateObjectURL.call(urlObject, obj);
+				}
+			} catch (error) {
+				// WeChat rejects the fallback Blob.
+			}
+			return "";
+		};
+		if (typeof urlObject.revokeObjectURL !== "function") {
+			urlObject.revokeObjectURL = function () {};
+		}
+	}
+	tolerateObjectURL(root.URL);
+	if (typeof URL === "object" && URL !== root.URL) {
+		tolerateObjectURL(URL);
+	}
+	function installDocument(doc) {
+		root.document = doc;
+		try {
+			document = doc;
+		} catch (error) {
+			// The host binding is not assignable. patch_wechat_document.js
+			// replaces Emscripten's canvas lookup instead.
+		}
+		if (typeof globalThis === "object" && globalThis) {
+			try {
+				globalThis.document = doc;
+			} catch (error) {
+				// Ignore a non-writable host document.
+			}
+		}
+		if (typeof window === "object" && window) {
+			try {
+				window.document = doc;
+			} catch (error) {
+				// Ignore a non-writable host document.
+			}
+		}
 	}
 	if (typeof AudioWorkletNode === "undefined") {
 		root.AudioWorkletNode = function AudioWorkletNode() {
@@ -61,6 +118,9 @@
 			return [];
 		};
 	}
+	if (typeof root.ontouchstart === "undefined") {
+		root.ontouchstart = null;
+	}
 	if (typeof root.devicePixelRatio !== "number") {
 		root.devicePixelRatio = 1;
 	}
@@ -98,6 +158,12 @@
 		root.location = { href: "wechat://minigame/", pathname: "/", protocol: "wechat:", search: "", hostname: "minigame" };
 	}
 
+	function logicalRect(canvas) {
+		var width = root.innerWidth || (canvas && canvas.width) || 0;
+		var height = root.innerHeight || (canvas && canvas.height) || 0;
+		return { x: 0, y: 0, left: 0, top: 0, width: width, height: height, right: width, bottom: height };
+	}
+
 	function decorateCanvas(canvas) {
 		if (!canvas) {
 			return canvas;
@@ -108,20 +174,32 @@
 		if (!canvas.style) {
 			canvas.style = {};
 		}
-		if (typeof canvas.addEventListener !== "function") {
-			canvas.addEventListener = function () {};
+		if (root.GodotWeChatHost && typeof root.GodotWeChatHost.decorateCanvas === "function") {
+			return root.GodotWeChatHost.decorateCanvas(canvas);
 		}
-		if (typeof canvas.removeEventListener !== "function") {
-			canvas.removeEventListener = function () {};
+		if (!canvas.__godotWeChatInput) {
+			canvas.__godotWeChatInput = true;
+			canvas.__godotWeChatListeners = {};
+			canvas.addEventListener = function (type, listener) {
+				var list = canvas.__godotWeChatListeners[type] || (canvas.__godotWeChatListeners[type] = []);
+				if (list.indexOf(listener) === -1) {
+					list.push(listener);
+				}
+			};
+			canvas.removeEventListener = function (type, listener) {
+				var list = canvas.__godotWeChatListeners[type] || [];
+				var index = list.indexOf(listener);
+				if (index >= 0) {
+					list.splice(index, 1);
+				}
+			};
 		}
 		if (typeof canvas.focus !== "function") {
 			canvas.focus = function () {};
 		}
-		if (typeof canvas.getBoundingClientRect !== "function") {
-			canvas.getBoundingClientRect = function () {
-				return { left: 0, top: 0, width: canvas.width || 0, height: canvas.height || 0, right: canvas.width || 0, bottom: canvas.height || 0 };
-			};
-		}
+		canvas.getBoundingClientRect = function () {
+			return logicalRect(canvas);
+		};
 		return canvas;
 	}
 
@@ -136,11 +214,8 @@
 		return root.__godotWeChatCanvas;
 	}
 
-	if (!root.document || typeof root.document !== "object") {
-		root.document = {};
-	}
-	if (typeof root.document.querySelector !== "function" || typeof root.document.getElementById !== "function") {
-		root.document = {
+	if (true) {
+		var installedDocument = {
 			getElementById: function (id) {
 				return id === "canvas" ? ensureCanvas() : null;
 			},
@@ -193,6 +268,10 @@
 			title: "",
 			currentScript: null,
 		};
+		installDocument(installedDocument);
 	}
-	root.GodotWeChatHost = { ensureCanvas: ensureCanvas };
+	if (!root.GodotWeChatHost) {
+		root.GodotWeChatHost = {};
+	}
+	root.GodotWeChatHost.ensureCanvas = ensureCanvas;
 })();

@@ -133,6 +133,7 @@ inline Plan plan_project(const String &p_appid, int p_godot_orientation, int64_t
 	}
 
 	plan.main_files.push_back("game.js");
+	plan.main_files.push_back("wechat_host_model.js");
 	plan.main_files.push_back("game.json");
 	plan.main_files.push_back("project.config.json");
 	plan.main_files.push_back("project.private.config.json");

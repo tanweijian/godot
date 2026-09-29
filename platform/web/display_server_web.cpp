@@ -36,6 +36,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/object/callable_method_pointer.h"
+#include "core/os/main_loop.h"
 #include "servers/rendering/dummy/rasterizer_dummy.h"
 
 #ifdef GLES3_ENABLED
@@ -1173,6 +1174,9 @@ DisplayServerWeb::DisplayServerWeb(const String &p_rendering_driver, WindowMode 
 			WINDOW_EVENT_FOCUS_IN,
 			WINDOW_EVENT_FOCUS_OUT);
 	godot_js_display_vk_cb(&DisplayServerWeb::vk_input_text_callback);
+#ifdef WECHAT_ENABLED
+	godot_js_wechat_lifecycle_cb(&DisplayServerWeb::wechat_lifecycle_callback);
+#endif
 
 	Input::get_singleton()->set_event_dispatch_function(_dispatch_input_event);
 }
@@ -1227,6 +1231,56 @@ bool DisplayServerWeb::has_feature(Feature p_feature) const {
 	}
 }
 
+#ifdef WECHAT_ENABLED
+static bool wechat_foreground = true;
+static bool wechat_pause_notified = false;
+static bool wechat_main_loop_started = false;
+
+bool DisplayServerWeb::wechat_is_foreground() {
+	return wechat_foreground;
+}
+
+static void wechat_apply_lifecycle() {
+	MainLoop *loop = OS::get_singleton() ? OS::get_singleton()->get_main_loop() : nullptr;
+	if (!wechat_foreground) {
+		if (loop && !wechat_pause_notified) {
+			if (Input::get_singleton()) {
+				Input::get_singleton()->release_pressed_events();
+			}
+			loop->notification(MainLoop::NOTIFICATION_APPLICATION_FOCUS_OUT);
+			loop->notification(MainLoop::NOTIFICATION_APPLICATION_PAUSED);
+			wechat_pause_notified = true;
+			print_line("WeChat Mini Game paused.");
+		}
+		// Pausing before emscripten_set_main_loop() can invalidate the loop
+		// that is about to start. The startup path calls again once it exists.
+		if (wechat_main_loop_started) {
+			emscripten_pause_main_loop();
+		}
+	} else if (wechat_pause_notified) {
+		if (wechat_main_loop_started) {
+			emscripten_resume_main_loop();
+		}
+		if (loop) {
+			loop->notification(MainLoop::NOTIFICATION_APPLICATION_FOCUS_IN);
+			loop->notification(MainLoop::NOTIFICATION_APPLICATION_RESUMED);
+			print_line("WeChat Mini Game resumed.");
+		}
+		wechat_pause_notified = false;
+	}
+}
+
+void DisplayServerWeb::wechat_lifecycle_callback(int p_foreground) {
+	wechat_foreground = p_foreground != 0;
+	wechat_apply_lifecycle();
+}
+
+void DisplayServerWeb::wechat_on_main_loop_started() {
+	wechat_main_loop_started = true;
+	wechat_apply_lifecycle();
+}
+#endif
+
 void DisplayServerWeb::register_web_driver() {
 	register_create_function("web", create_func, get_rendering_drivers_func);
 }
@@ -1266,6 +1320,13 @@ Rect2i DisplayServerWeb::screen_get_usable_rect(int p_screen) const {
 	int screen_count = get_screen_count();
 	ERR_FAIL_INDEX_V(p_screen, screen_count, Rect2i());
 
+#ifdef WECHAT_ENABLED
+	int safe_area[4] = { 0, 0, 0, 0 };
+	godot_js_display_safe_area_get(safe_area);
+	if (safe_area[2] > 0 && safe_area[3] > 0) {
+		return Rect2i(safe_area[0], safe_area[1], safe_area[2], safe_area[3]);
+	}
+#endif
 	int size[2];
 	godot_js_display_window_size_get(size, size + 1);
 	return Rect2i(0, 0, size[0], size[1]);

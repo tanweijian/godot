@@ -135,6 +135,11 @@ extern void godot_js_display_vk_cb(void (*p_input)(const char *p_text, int p_cur
 extern void godot_js_display_vk_show(const char *p_text, int p_type, int p_start, int p_end);
 extern void godot_js_display_vk_hide();
 
+#ifdef WECHAT_ENABLED
+extern void godot_js_display_safe_area_get(int32_t *p_rect);
+extern void godot_js_wechat_lifecycle_cb(void (*p_callback)(int p_foreground));
+#endif
+
 #ifdef __cplusplus
 }
 #endif

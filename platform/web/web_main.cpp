@@ -167,6 +167,12 @@ extern EMSCRIPTEN_KEEPALIVE int godot_web_main(int argc, char *argv[]) {
 	emscripten_set_main_loop(main_loop_callback, -1, false);
 	// Immediately run the first iteration.
 	// We are inside an animation frame, we want to immediately draw on the newly setup canvas.
+#ifdef WECHAT_ENABLED
+	DisplayServerWeb::wechat_on_main_loop_started();
+	if (!DisplayServerWeb::wechat_is_foreground()) {
+		return os->get_exit_code();
+	}
+#endif
 	main_loop_callback();
 
 	return os->get_exit_code();

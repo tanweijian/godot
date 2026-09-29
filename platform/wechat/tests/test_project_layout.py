@@ -3,11 +3,13 @@ import unittest
 from pathlib import Path
 
 from project_layout import (
+    HOST_MODEL,
     MAIN_PACKAGE_LIMIT_BYTES,
     MIN_BASE_LIBRARY,
     PREVIEW_APPID,
     SHELL,
     device_orientation_from_godot,
+    host_contract_markers,
     is_valid_appid,
     plan_project,
     project_appid,
@@ -46,6 +48,7 @@ class WeChatProjectLayoutTest(unittest.TestCase):
         small = plan_project("", 0, 2048, 4096, [("godot.wasm", 1024), ("godot.js", 512)])
         self.assertFalse(small["use_runtime_subpackage"])
         self.assertIn("godot.wasm", small["main_files"])
+        self.assertIn("wechat_host_model.js", small["main_files"])
 
         large = plan_project("wx0123456789abcdef", 0, 2048, 4096, [("godot.wasm", 5 * 1024 * 1024)])
         self.assertTrue(large["valid"])
@@ -63,6 +66,9 @@ class WeChatProjectLayoutTest(unittest.TestCase):
         source = SHELL.read_text(encoding="utf-8")
         for marker in shell_contract_markers():
             self.assertIn(marker, source)
+        host_source = HOST_MODEL.read_text(encoding="utf-8")
+        for marker in host_contract_markers():
+            self.assertIn(marker, host_source)
         rendered = substitute_shell(
             source,
             {
