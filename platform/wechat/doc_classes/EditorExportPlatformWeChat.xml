@@ -4,7 +4,8 @@
 		Exporter for WeChat Mini Game.
 	</brief_description>
 	<description>
-		Exports a Godot project as a directory that opens in WeChat Developer Tools. The generated project loads a single-threaded, non-SIMD WebAssembly runtime and starts the Compatibility renderer on a WebGL 2 canvas.
+		Exports a Godot project as a directory that opens in WeChat Developer Tools. The generated project loads a single-threaded, non-SIMD WebAssembly runtime and starts the Compatibility renderer on a WebGL 2 canvas for both 2D and basic 3D.
+		A project that does not resolve to the Compatibility renderer is rejected before export. At startup the project checks that WebGL 2 can compile a Compatibility shader and provide a depth buffer. Missing stencil, float color buffers, instancing, or MSAA are reported and skipped instead of crashing. Shader compilation failures are shown with the driver log. Frame rate and memory are logged as device baselines and are not a guaranteed minimum.
 		An empty AppID is written as the WeChat local-preview AppID so the project can be opened before a production AppID exists.
 	</description>
 	<tutorials>

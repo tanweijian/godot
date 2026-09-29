@@ -178,6 +178,225 @@ function changedTouchEvent(wxEvent) {
 	};
 }
 
+function isIOSEnvironment(environment) {
+	environment = environment || {};
+	var text = [environment.platform, environment.system, environment.model].join(" ").toLowerCase();
+	return text.indexOf("ios") >= 0 || text.indexOf("iphone") >= 0 || text.indexOf("ipad") >= 0;
+}
+
+function compatibility3DFailure(title, message) {
+	return { ok: false, title: title, message: message, degradations: [] };
+}
+
+function compileProbeStage(gl, type, source) {
+	var shader = gl.createShader(type);
+	if (!shader) {
+		return { ok: false, shader: null, log: "createShader returned null" };
+	}
+	gl.shaderSource(shader, source);
+	gl.compileShader(shader);
+	var status = gl.getShaderParameter(shader, gl.COMPILE_STATUS);
+	return { ok: !!status, shader: shader, log: gl.getShaderInfoLog(shader) || "" };
+}
+
+function probeCompatibility3D(gl, environment) {
+	if (!gl) {
+		return compatibility3DFailure(
+			"WebGL 2 unavailable",
+			"Canvas.getContext('webgl2') returned null. The Compatibility renderer requires WebGL 2, which WeChat documents from base library 2.24.0. Raise the Developer Tools base library and, on iOS, enable high-performance mode."
+		);
+	}
+	var attributes = null;
+	try {
+		attributes = typeof gl.getContextAttributes === "function" ? gl.getContextAttributes() : null;
+	} catch (error) {
+		return compatibility3DFailure(
+			"Depth buffer unavailable",
+			"Reading the WebGL 2 context attributes failed: " + error + ". A Compatibility 3D mesh needs a depth buffer. WeChat documents context attributes for webgl, not webgl2. Set the base library to 2.24.0 or newer and enable iOS high-performance mode."
+		);
+	}
+	if (!attributes || attributes.depth !== true) {
+		return compatibility3DFailure(
+			"Depth buffer unavailable",
+			"This WebGL 2 context has no depth buffer, so a Compatibility mesh cannot render and the project would otherwise stay blank. WeChat documents context attributes for webgl, not webgl2. Set Developer Tools Details > Local Settings > Base library to 2.24.0 or newer, update the WeChat client, and on iOS enable high-performance mode (iOS 15+) or high-performance+ mode."
+		);
+	}
+	if (typeof gl.createShader !== "function" || typeof gl.createProgram !== "function") {
+		return compatibility3DFailure(
+			"Shader compiler unavailable",
+			"This WebGL 2 context cannot compile a shader. Compatibility 3D requires a WebGL 2 shader compiler from base library 2.24.0. On iOS enable high-performance mode."
+		);
+	}
+	var vertexSource = "#version 300 es\nvoid main() { gl_Position = vec4(0.0, 0.0, 0.0, 1.0); }\n";
+	var fragmentSource = "#version 300 es\nprecision mediump float;\nout vec4 frag_color;\nvoid main() { frag_color = vec4(1.0, 0.45, 0.12, 1.0); }\n";
+	var vertex;
+	var fragment;
+	var program = null;
+	try {
+		vertex = compileProbeStage(gl, gl.VERTEX_SHADER, vertexSource);
+		fragment = compileProbeStage(gl, gl.FRAGMENT_SHADER, fragmentSource);
+		if (!vertex.ok || !fragment.ok) {
+			var log = vertex.log || fragment.log || "shader compilation failed";
+			return compatibility3DFailure(
+				"Shader compiler unavailable",
+				"A minimal Compatibility shader failed to compile: " + log + ". The Compatibility renderer needs a working WebGL 2 shader compiler. Set the base library to 2.24.0 or newer. On iOS enable high-performance mode (iOS 15+) or high-performance+ mode."
+			);
+		}
+		program = gl.createProgram();
+		gl.attachShader(program, vertex.shader);
+		gl.attachShader(program, fragment.shader);
+		gl.linkProgram(program);
+		if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+			var linkLog = gl.getProgramInfoLog(program) || "program link failed";
+			return compatibility3DFailure(
+				"Shader compiler unavailable",
+				"A minimal Compatibility shader failed to link: " + linkLog + ". Set the base library to 2.24.0 or newer and enable iOS high-performance mode."
+			);
+		}
+	} catch (error) {
+		return compatibility3DFailure(
+			"Shader compiler unavailable",
+			"Compiling a Compatibility shader threw: " + error + ". Set the base library to 2.24.0 or newer and enable iOS high-performance mode."
+		);
+	} finally {
+		if (vertex && vertex.shader && gl.deleteShader) {
+			gl.deleteShader(vertex.shader);
+		}
+		if (fragment && fragment.shader && gl.deleteShader) {
+			gl.deleteShader(fragment.shader);
+		}
+		if (program && gl.deleteProgram) {
+			gl.deleteProgram(program);
+		}
+	}
+	var degradations = [];
+	if (!attributes.stencil) {
+		degradations.push({
+			title: "Stencil unavailable",
+			message: "Stencil is unavailable on this WebGL 2 context. CanvasItem clipping, some masks, and stencil-reading shaders will be skipped instead of crashing. WeChat often leaves stencil false even when depth is present. Remove stencil-dependent materials if those effects are blank.",
+		});
+	}
+	var floatBuffer = null;
+	try {
+		floatBuffer = gl.getExtension("EXT_color_buffer_float");
+	} catch (error) {
+		floatBuffer = null;
+	}
+	if (!floatBuffer) {
+		degradations.push({
+			title: "Float color buffers unavailable",
+			message: "EXT_color_buffer_float is missing. HDR, glow, and some post-processing will be skipped. A standard-material Compatibility scene does not need this extension.",
+		});
+	}
+	if (typeof gl.drawArraysInstanced !== "function") {
+		degradations.push({
+			title: "Instancing unavailable",
+			message: "drawArraysInstanced is missing, so GPU instancing is unavailable. MultiMesh draws will be skipped or submitted one at a time instead of crashing. Reduce instancing if meshes flicker.",
+		});
+	}
+	if (isIOSEnvironment(environment)) {
+		degradations.push({
+			title: "iOS WebGL 2 limits",
+			message: "iOS WebGL 2 needs high-performance mode on iOS 15 or newer, or high-performance+ mode. WeChat does not guarantee every WebGL 2 feature. If meshes flicker or disappear, reduce instanced draws and uniform count.",
+		});
+	}
+	return { ok: true, title: "", message: "", degradations: degradations };
+}
+
+function diagnoseRendererMessage(text) {
+	if (!text) {
+		return null;
+	}
+	var message = String(text);
+	if (message.indexOf("did not draw the lit mesh") >= 0) {
+		return {
+			fatal: true,
+			title: "Compatibility 3D blank",
+			message: message + " The Compatibility renderer started but the lit mesh is not visible. Check the shader log above. On iOS enable high-performance mode (iOS 15+) or high-performance+ mode. Confirm startup reported a depth buffer, and keep rendering/renderer/rendering_method at gl_compatibility.",
+		};
+	}
+	if (message.indexOf("shader compilation failed") >= 0 || message.indexOf("Program linking failed") >= 0 || message.indexOf("No OpenGL vertex shader") >= 0 || message.indexOf("No OpenGL fragment shader") >= 0 || message.indexOf("No OpenGL program link") >= 0) {
+		return {
+			fatal: true,
+			title: "Shader failed",
+			message: message + " Remove the custom shader or the unsupported feature (compute, multiview, cubemap arrays, samplerCubeArray). Forward+, Mobile, and Vulkan shaders cannot run here. Set rendering/renderer/rendering_method to gl_compatibility.",
+		};
+	}
+	if (message.indexOf("MSAA is not supported") >= 0) {
+		return {
+			fatal: false,
+			title: "MSAA unavailable",
+			message: message + " The scene still renders without multisampling. Turn off viewport MSAA to silence this.",
+		};
+	}
+	if (message.indexOf("GPUParticles are not supported") >= 0) {
+		return {
+			fatal: false,
+			title: "GPUParticles unavailable",
+			message: message + " Replace GPUParticles3D with CPUParticles3D.",
+		};
+	}
+	if (message.indexOf("Dual paraboloid") >= 0 || message.indexOf("not supported in the Compatibility renderer") >= 0 || message.indexOf("not supported in OpenGL renderer") >= 0) {
+		return {
+			fatal: false,
+			title: "Renderer feature unavailable",
+			message: message + " That feature was skipped. Use a Compatibility-supported alternative, such as CubeMap shadows instead of dual paraboloid shadows, and keep the project on gl_compatibility.",
+		};
+	}
+	if (message.indexOf("Unable to initialize WebGL") >= 0) {
+		return {
+			fatal: true,
+			title: "WebGL 2 unavailable",
+			message: message + " The Compatibility renderer requires WebGL 2 from WeChat base library 2.24.0. On iOS enable high-performance mode.",
+		};
+	}
+	return null;
+}
+
+function samplePerformance(reading) {
+	reading = reading || {};
+	var frameCount = reading.frameCount;
+	var elapsedMs = reading.elapsedMs;
+	var fps = null;
+	if (typeof frameCount === "number" && typeof elapsedMs === "number" && elapsedMs > 0 && frameCount >= 0) {
+		fps = Math.round((frameCount * 1000) / elapsedMs);
+	}
+	var memoryBytes = typeof reading.memoryBytes === "number" && isFinite(reading.memoryBytes) && reading.memoryBytes >= 0 ? Math.round(reading.memoryBytes) : null;
+	return {
+		fps: fps,
+		memoryBytes: memoryBytes,
+		memoryLabel: reading.memoryLabel || (memoryBytes === null ? "unavailable" : "bytes"),
+		guaranteed: false,
+		note: "Device baseline only. WeChat Compatibility 3D does not promise a minimum frame rate or memory limit.",
+	};
+}
+
+function readPerformanceSample(wx, performanceObject, startedMs, frameCount, nowMs) {
+	var memoryBytes = null;
+	var memoryLabel = "unavailable";
+	if (performanceObject && performanceObject.memory && typeof performanceObject.memory.usedJSHeapSize === "number") {
+		memoryBytes = performanceObject.memory.usedJSHeapSize;
+		memoryLabel = "usedJSHeapSize";
+	}
+	if (memoryBytes === null && wx && typeof wx.getPerformance === "function") {
+		try {
+			var manager = wx.getPerformance();
+			if (manager && manager.memory && typeof manager.memory.usedJSHeapSize === "number") {
+				memoryBytes = manager.memory.usedJSHeapSize;
+				memoryLabel = "wx.getPerformance";
+			}
+		} catch (error) {
+			console.error("[Godot] wx.getPerformance failed: " + error);
+		}
+	}
+	return samplePerformance({
+		frameCount: frameCount,
+		elapsedMs: nowMs - startedMs,
+		memoryBytes: memoryBytes,
+		memoryLabel: memoryLabel,
+	});
+}
+
 function createHost() {
 	var runtimeToken = { kind: "godot-wechat-runtime" };
 	var metrics = metricsFromInfo({});
@@ -374,9 +593,13 @@ var api = {
 	changedTouchEvent: changedTouchEvent,
 	createHost: createHost,
 	cssRect: cssRect,
+	diagnoseRendererMessage: diagnoseRendererMessage,
 	metricsFromInfo: metricsFromInfo,
+	probeCompatibility3D: probeCompatibility3D,
+	readPerformanceSample: readPerformanceSample,
 	readWindowInfo: readWindowInfo,
 	safeAreaPixels: safeAreaPixels,
+	samplePerformance: samplePerformance,
 	touchToGodot: touchToGodot,
 };
 

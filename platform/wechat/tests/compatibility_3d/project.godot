@@ -1,0 +1,22 @@
+; Engine configuration file.
+config_version=5
+
+[application]
+
+config/name="WeChat Compatibility 3D"
+config/features=PackedStringArray("4.5")
+run/main_scene="res://main.tscn"
+
+[display]
+
+window/size/viewport_width=480
+window/size/viewport_height=854
+window/stretch/mode="canvas_items"
+window/stretch/aspect="keep"
+window/handheld/orientation=1
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+environment/defaults/default_clear_color=Color(0.05, 0.08, 0.16, 1)
+textures/vram_compression/import_etc2_astc=true

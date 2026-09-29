@@ -26,16 +26,38 @@ function godotWeChatHost() {
 	return root.GodotWeChatHost;
 }
 
+var godotWeChatReported = {};
+
 function godotWeChatFail(title, message) {
 	var text = "[Godot] " + title + ": " + message;
 	console.error(text);
 	if (typeof wx !== "undefined" && wx.showModal) {
+		var content = String(message);
+		if (content.length > 900) {
+			content = content.slice(0, 900) + "... See the console for the full log.";
+		}
 		wx.showModal({
 			title: title,
-			content: message,
+			content: content,
 			showCancel: false,
 		});
 	}
+}
+
+function godotWeChatReport(diagnosis) {
+	if (!diagnosis) {
+		return;
+	}
+	var key = diagnosis.title + ":" + diagnosis.fatal;
+	if (godotWeChatReported[key]) {
+		return;
+	}
+	godotWeChatReported[key] = true;
+	if (diagnosis.fatal) {
+		godotWeChatFail(diagnosis.title, diagnosis.message);
+		return;
+	}
+	console.warn("[Godot] " + diagnosis.title + ": " + diagnosis.message);
 }
 
 function godotWeChatCompareVersion(left, right) {
@@ -99,6 +121,20 @@ function godotWeChatPrepareCanvas() {
 	return godotWeChatHost().prepareCanvas(canvas);
 }
 
+function godotWeChatReleaseProbeContext(context) {
+	if (!context || typeof context.getExtension !== "function") {
+		return;
+	}
+	try {
+		var lose = context.getExtension("WEBGL_lose_context");
+		if (lose && lose.loseContext) {
+			lose.loseContext();
+		}
+	} catch (error) {
+		console.error("[Godot] releasing the WebGL probe context failed: " + error);
+	}
+}
+
 function godotWeChatProbeWebGL2() {
 	var probe = wx.createCanvas();
 	var context = null;
@@ -111,12 +147,23 @@ function godotWeChatProbeWebGL2() {
 		);
 		return false;
 	}
-	if (!context) {
-		godotWeChatFail(
-			"WebGL 2 unavailable",
-			"Canvas.getContext('webgl2') returned null. The Compatibility renderer requires WebGL 2, which WeChat documents from base library 2.24.0. Raise the Developer Tools base library and confirm the simulator or device supports WebGL 2."
-		);
+	var environment = {};
+	try {
+		if (wx.getSystemInfoSync) {
+			environment = wx.getSystemInfoSync() || {};
+		}
+	} catch (error) {
+		console.error("[Godot] wx.getSystemInfoSync failed: " + error);
+	}
+	var report = WeChatHost.probeCompatibility3D(context, environment);
+	godotWeChatReleaseProbeContext(context);
+	if (!report.ok) {
+		godotWeChatFail(report.title, report.message);
 		return false;
+	}
+	var i;
+	for (i = 0; i < report.degradations.length; i++) {
+		console.warn("[Godot] " + report.degradations[i].title + ": " + report.degradations[i].message);
 	}
 	return true;
 }
@@ -280,6 +327,8 @@ function godotWeChatStartEngine() {
 		},
 		printErr: function () {
 			console.error.apply(console, arguments);
+			var text = Array.prototype.map.call(arguments, String).join(" ");
+			godotWeChatReport(WeChatHost.diagnoseRendererMessage(text));
 		},
 		locateFile: function (path) {
 			var slash = path.lastIndexOf("/");
@@ -331,8 +380,37 @@ function godotWeChatStartEngine() {
 			console.log("[Godot] starting Compatibility renderer");
 			module.callMain(["--main-pack", "/game.pck"]);
 			console.log("[Godot] engine main started");
+			godotWeChatRecordBaseline();
 		});
 	});
+}
+
+function godotWeChatRecordBaseline() {
+	var started = Date.now();
+	var frames = 0;
+	function tick() {
+		frames += 1;
+		var now = Date.now();
+		if (now - started < 2000) {
+			if (typeof requestAnimationFrame === "function") {
+				requestAnimationFrame(tick);
+			} else {
+				setTimeout(tick, 16);
+			}
+			return;
+		}
+		var performanceObject = typeof performance !== "undefined" ? performance : null;
+		var sample = WeChatHost.readPerformanceSample(typeof wx !== "undefined" ? wx : null, performanceObject, started, frames, now);
+		var recorded = WeChatHost.samplePerformance({
+			frameCount: frames,
+			elapsedMs: now - started,
+			memoryBytes: sample.memoryBytes,
+			memoryLabel: sample.memoryLabel,
+		});
+		console.log("[Godot] baseline hostFps=" + recorded.fps + " memoryBytes=" + recorded.memoryBytes + " label=" + recorded.memoryLabel + " guaranteed=false");
+		console.log("[Godot] " + recorded.note);
+	}
+	tick();
 }
 
 function godotWeChatBoot() {
@@ -360,6 +438,12 @@ function godotWeChatBoot() {
 			"This project requires WeChat base library " + GODOT_MIN_BASE_LIBRARY + " or newer. Found " + sdkVersion + ". In Developer Tools, set Details > Local Settings > Base library to " + GODOT_MIN_BASE_LIBRARY + " or newer, or update the WeChat client."
 		);
 		return;
+	}
+	if (wx.onMemoryWarning) {
+		wx.onMemoryWarning(function (warning) {
+			var level = warning && warning.level;
+			console.warn("[Godot] memory warning level=" + level + ". This is a device baseline signal, not a crash. Reduce texture size or scene complexity if the client closes the game. guaranteed=false");
+		});
 	}
 	godotWeChatApplyWindowMetrics();
 	godotWeChatPrepareCanvas();
