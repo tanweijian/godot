@@ -327,6 +327,7 @@ def generate_scu_files(max_includes_per_scu):
     process_folder(["platform/linuxbsd/export"])
     process_folder(["platform/macos/export"])
     process_folder(["platform/web/export"])
+    process_folder(["platform/wechat/export"])
     process_folder(["platform/windows/export"])
 
     process_folder(["modules/lightmapper_rd"])

@@ -202,6 +202,7 @@
 #endif // MODULE_NAVIGATION_3D_ENABLED
 
 #include "modules/modules_tests.gen.h"
+#include "tests/editor/test_wechat_project_layout.h"
 
 #include "tests/display_server_mock.h"
 #include "tests/test_macros.h"

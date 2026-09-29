@@ -1,0 +1,138 @@
+#!/usr/bin/env python
+from misc.utility.scons_hints import *
+
+import json
+import os
+import subprocess
+
+Import("env")
+
+web_files = [
+    "#platform/web/audio_driver_web.cpp",
+    "#platform/web/webmidi_driver.cpp",
+    "#platform/web/display_server_web.cpp",
+    "#platform/web/http_client_web.cpp",
+    "#platform/web/javascript_bridge_singleton.cpp",
+    "#platform/web/web_main.cpp",
+    "#platform/web/ip_web.cpp",
+    "#platform/web/net_socket_web.cpp",
+    "#platform/web/os_web.cpp",
+    "#platform/web/web_runtime.cpp",
+]
+
+build_env = env.Clone()
+build_env.AddJSLibraries(
+    [
+        "#platform/web/js/libs/library_godot_audio.js",
+        "#platform/web/js/libs/library_godot_display.js",
+        "#platform/web/js/libs/library_godot_emscripten.js",
+        "#platform/web/js/libs/library_godot_fetch.js",
+        "#platform/web/js/libs/library_godot_webmidi.js",
+        "#platform/web/js/libs/library_godot_os.js",
+        "#platform/web/js/libs/library_godot_runtime.js",
+        "#platform/web/js/libs/library_godot_input.js",
+        "#platform/web/js/libs/library_godot_webgl2.js",
+    ]
+)
+build_env.AddJSExterns(["#platform/web/js/libs/library_godot_webgl2.externs.js"])
+build_env.AddJSPost(["#platform/web/js/patches/patch_em_gl.js"])
+build_env.AddJSPre(["#platform/wechat/js/wechat_host_bridge.js"])
+if env["javascript_eval"]:
+    build_env.AddJSLibraries(["#platform/web/js/libs/library_godot_javascript_singleton.js"])
+
+for lib in build_env["JS_LIBS"]:
+    build_env.Append(LINKFLAGS=["--js-library", lib.abspath])
+for js in build_env["JS_PRE"]:
+    build_env.Append(LINKFLAGS=["--pre-js", js.abspath])
+for js in build_env["JS_POST"]:
+    build_env.Append(LINKFLAGS=["--post-js", js.abspath])
+export_js = env.File("#platform/wechat/js/wechat_export.js")
+build_env.Append(LINKFLAGS=["--extern-post-js", export_js.abspath])
+
+build_env["ENV"]["EMCC_CLOSURE_ARGS"] = build_env["ENV"].get("EMCC_CLOSURE_ARGS", "")
+for ext in build_env["JS_EXTERNS"]:
+    build_env["ENV"]["EMCC_CLOSURE_ARGS"] += " --externs " + ext.abspath
+build_env["ENV"]["EMCC_CLOSURE_ARGS"] = build_env["ENV"]["EMCC_CLOSURE_ARGS"].strip()
+
+if len(env["EXPORTED_FUNCTIONS"]):
+    build_env.Append(LINKFLAGS=["-sEXPORTED_FUNCTIONS=" + repr(sorted(list(set(env["EXPORTED_FUNCTIONS"]))))])
+if len(env["EXPORTED_RUNTIME_METHODS"]):
+    build_env.Append(LINKFLAGS=["-sEXPORTED_RUNTIME_METHODS=" + repr(sorted(list(set(env["EXPORTED_RUNTIME_METHODS"]))))])
+
+# Emscripten 4.0.11 wasm-opt hits a binaryen validator assertion on this
+# single-threaded wasm-longjmp build. Keep LLVM -Os objects, but pass -O1 last
+# so the linker skips wasm-opt.
+build_env.Append(LINKFLAGS=["-O1"])
+build_env.Append(LIBS=["idbfs.js"])
+build_targets = ["#bin/godot${PROGSUFFIX}.js", "#bin/godot${PROGSUFFIX}.wasm"]
+build = build_env.add_program(build_targets, web_files)
+wasm_br = env.Command(
+    "#bin/godot${PROGSUFFIX}.wasm.br",
+    build[1],
+    "node platform/wechat/tools/brotli_wasm.js $SOURCE $TARGET",
+)
+build_env.Depends(build[0], build_env["JS_LIBS"])
+build_env.Depends(build[0], build_env["JS_PRE"])
+build_env.Depends(build[0], build_env["JS_POST"])
+build_env.Depends(build[0], build_env["JS_EXTERNS"])
+build_env.Depends(build[0], export_js)
+
+
+def _revision():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Dir("#").abspath, text=True).strip()
+    except Exception:
+        return ""
+
+
+def _emscripten_version():
+    emcc = os.environ.get("EMCC") or "emcc"
+    try:
+        output = subprocess.check_output([emcc, "--version"], text=True, shell=os.name == "nt")
+    except Exception:
+        return ""
+    first = output.splitlines()[0] if output else ""
+    for part in first.split():
+        if part[:1].isdigit():
+            return part
+    return first
+
+
+build_info = {
+    "godotRevision": _revision(),
+    "emscriptenVersion": _emscripten_version(),
+    "threads": False,
+    "simd": False,
+    "renderer": "gl_compatibility",
+}
+info_path = env.File("#bin/godot${PROGSUFFIX}.wechat-build.json")
+info_text = env.Textfile(info_path, [env.Value(json.dumps(build_info, indent=2) + "\n")])
+
+zip_dir = env.Dir("#bin/.wechat_zip")
+in_files = [
+    build[0],
+    wasm_br,
+    "#platform/wechat/js/game.js",
+    "#platform/wechat/js/runtime_game.js",
+    "#platform/web/js/libs/audio.worklet.js",
+    "#platform/web/js/libs/audio.position.worklet.js",
+    info_text,
+]
+out_files = [
+    zip_dir.File("godot.js"),
+    zip_dir.File("godot.wasm.br"),
+    zip_dir.File("game.js"),
+    zip_dir.File("runtime_game.js"),
+    zip_dir.File("godot.audio.worklet.js"),
+    zip_dir.File("godot.audio.position.worklet.js"),
+    zip_dir.File("wechat-build.json"),
+]
+installed = env.NoCache(env.InstallAs(out_files, in_files))
+
+def _drop_uncompressed_wasm(target, source, env):
+    stale = os.path.join(zip_dir.abspath, "godot.wasm")
+    if os.path.exists(stale):
+        os.remove(stale)
+
+env.AddPostAction(installed, _drop_uncompressed_wasm)
+env.NoCache(env.Zip("#bin/godot", installed, ZIPROOT=zip_dir, ZIPSUFFIX="${PROGSUFFIX}${ZIPSUFFIX}"))
