@@ -69,6 +69,45 @@ const GodotWeChat = {
 			});
 		}
 	},
+
+	godot_js_wechat_load_resource_subpackage__deps: ['$GodotWeChat', '$GodotRuntime', '$FS'],
+	godot_js_wechat_load_resource_subpackage__proxy: 'sync',
+	godot_js_wechat_load_resource_subpackage__sig: 'iii',
+	godot_js_wechat_load_resource_subpackage: function (p_name, p_callback) {
+		const name = GodotRuntime.parseString(p_name);
+		const callback = GodotRuntime.get_func(p_callback);
+		const host = GodotWeChat.host();
+		function emit(event, progress, detail) {
+			const namePtr = GodotRuntime.allocString(name);
+			const detailPtr = detail ? GodotRuntime.allocString(String(detail)) : 0;
+			callback(namePtr, event, progress | 0, detailPtr);
+		}
+		if (!host || typeof host.loadResourceSubpackage !== 'function') {
+			emit(0, 0, 'WeChat resource subpackage loading is unavailable. The resource pack was not mounted.');
+			return 2;
+		}
+		return host.loadResourceSubpackage(name, {
+			progress: function (percent) {
+				emit(1, percent, '');
+			},
+			success: function (bytes) {
+				try {
+					const dir = '/wechat-packs';
+					const path = dir + '/' + name + '.bin';
+					if (!FS.analyzePath(dir).exists) {
+						FS.mkdir(dir);
+					}
+					FS.writeFile(path, bytes);
+					emit(2, 100, path);
+				} catch (error) {
+					emit(0, 0, 'WeChat resource subpackage "' + name + '" loaded, but its resource pack could not be written for mounting: ' + error);
+				}
+			},
+			failure: function (message) {
+				emit(0, 0, message);
+			},
+		});
+	},
 };
 
 autoAddDeps(GodotWeChat, '$GodotWeChat');

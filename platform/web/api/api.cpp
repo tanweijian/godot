@@ -33,6 +33,9 @@
 #include "javascript_bridge_singleton.h"
 
 #include "core/config/engine.h"
+#ifdef WECHAT_ENABLED
+#include "platform/wechat/wechat_runtime.h"
+#endif
 
 static JavaScriptBridge *javascript_bridge_singleton;
 
@@ -41,9 +44,15 @@ void register_web_api() {
 	GDREGISTER_ABSTRACT_CLASS(JavaScriptBridge);
 	javascript_bridge_singleton = memnew(JavaScriptBridge);
 	Engine::get_singleton()->add_singleton(Engine::Singleton("JavaScriptBridge", javascript_bridge_singleton));
+#ifdef WECHAT_ENABLED
+	register_wechat_runtime();
+#endif
 }
 
 void unregister_web_api() {
+#ifdef WECHAT_ENABLED
+	unregister_wechat_runtime();
+#endif
 	memdelete(javascript_bridge_singleton);
 }
 

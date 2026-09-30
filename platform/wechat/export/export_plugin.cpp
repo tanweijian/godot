@@ -37,9 +37,12 @@
 #include "core/io/dir_access.h"
 #include "core/io/file_access.h"
 #include "core/io/json.h"
+#include "core/io/pck_packer.h"
+#include "core/io/resource_uid.h"
 #include "core/io/zip_io.h"
 #include "core/string/print_string.h"
 #include "core/templates/hash_map.h"
+#include "core/templates/hash_set.h"
 #include "editor/editor_node.h"
 #include "editor/editor_string_names.h"
 #include "editor/export/editor_export.h"
@@ -62,6 +65,32 @@ String _substitute(String p_text, const HashMap<String, String> &p_replaces) {
 		p_text = p_text.replace(kv.key, kv.value);
 	}
 	return p_text;
+}
+
+void _collect_relative_files(const String &p_root, const String &p_relative, Vector<String> &r_files) {
+	const String current = p_relative.is_empty() ? p_root : p_root.path_join(p_relative);
+	Ref<DirAccess> dir = DirAccess::open(current);
+	if (dir.is_null()) {
+		return;
+	}
+	dir->list_dir_begin();
+	String name = dir->get_next();
+	Vector<String> subdirs;
+	while (!name.is_empty()) {
+		if (name != "." && name != "..") {
+			const String relative = p_relative.is_empty() ? name : p_relative.path_join(name);
+			if (dir->current_is_dir()) {
+				subdirs.push_back(relative.replace("\\", "/"));
+			} else {
+				r_files.push_back(relative.replace("\\", "/"));
+			}
+		}
+		name = dir->get_next();
+	}
+	dir->list_dir_end();
+	for (int i = 0; i < subdirs.size(); i++) {
+		_collect_relative_files(p_root, subdirs[i], r_files);
+	}
 }
 
 Error _write_text(const String &p_path, const String &p_text) {
@@ -98,17 +127,19 @@ Dictionary _network_timeout() {
 	return timeout;
 }
 
-String _game_json(const String &p_orientation, bool p_subpackage) {
+String _game_json(const String &p_orientation, const Vector<WeChatProjectLayout::SubpackageEntry> &p_subpackages) {
 	Dictionary game;
 	game["deviceOrientation"] = p_orientation;
 	game["showStatusBar"] = false;
 	game["networkTimeout"] = _network_timeout();
-	if (p_subpackage) {
-		Dictionary entry;
-		entry["name"] = WeChatProjectLayout::RUNTIME_SUBPACKAGE_NAME;
-		entry["root"] = String(WeChatProjectLayout::RUNTIME_SUBPACKAGE_ROOT) + "/";
+	if (!p_subpackages.is_empty()) {
 		Array subpackages;
-		subpackages.push_back(entry);
+		for (int i = 0; i < p_subpackages.size(); i++) {
+			Dictionary entry;
+			entry["name"] = p_subpackages[i].name;
+			entry["root"] = p_subpackages[i].root;
+			subpackages.push_back(entry);
+		}
 		game["subpackages"] = subpackages;
 	}
 	return JSON::stringify(game, "\t", false, true);
@@ -188,7 +219,7 @@ String _private_config() {
 	return JSON::stringify(config, "\t", false, true);
 }
 
-String _manifest_json(const WeChatProjectLayout::Plan &p_plan, const String &p_project_name, int p_orientation, const String &p_revision, const String &p_emscripten) {
+String _manifest_json(const WeChatProjectLayout::Plan &p_plan, const String &p_project_name, int p_orientation, const String &p_revision, const String &p_emscripten, const Vector<WeChatProjectLayout::ResourceGroupPlan> &p_groups, int64_t p_budget_bytes) {
 	Dictionary manifest;
 	manifest["format"] = 1;
 	manifest["projectName"] = p_project_name;
@@ -198,6 +229,8 @@ String _manifest_json(const WeChatProjectLayout::Plan &p_plan, const String &p_p
 	manifest["godotOrientation"] = p_orientation;
 	manifest["minBaseLibrary"] = WeChatProjectLayout::MIN_BASE_LIBRARY;
 	manifest["mainPackageLimitBytes"] = WeChatProjectLayout::MAIN_PACKAGE_LIMIT_BYTES;
+	manifest["totalPackageBudgetBytes"] = p_budget_bytes;
+	manifest["resourceGroups"] = WeChatProjectLayout::resource_group_manifest(p_groups);
 	manifest["runtimeSubpackage"] = p_plan.use_runtime_subpackage ? String(WeChatProjectLayout::RUNTIME_SUBPACKAGE_NAME) : String();
 	manifest["renderer"] = "gl_compatibility";
 	manifest["threads"] = false;
@@ -226,7 +259,96 @@ struct ShellTexts {
 	int64_t bytes = 0;
 };
 
-ShellTexts _build_shell(const String &p_template, const WeChatProjectLayout::Plan &p_plan, const String &p_project_name, int p_orientation, const String &p_revision, const String &p_emscripten, const String &p_wasm_name) {
+struct CapturedProject {
+	String root;
+	HashMap<String, String> staged;
+	Vector<WeChatProjectLayout::ResourceFile> resources;
+};
+
+Vector<String> _split_filter(const String &p_filter) {
+	Vector<String> filters;
+	const Vector<String> parts = p_filter.split(",");
+	for (int i = 0; i < parts.size(); i++) {
+		const String filter = parts[i].strip_edges();
+		if (!filter.is_empty()) {
+			filters.push_back(filter);
+		}
+	}
+	return filters;
+}
+
+bool _encrypt_path(const String &p_path, const Vector<String> &p_in, const Vector<String> &p_ex) {
+	bool encrypt = false;
+	for (int i = 0; i < p_in.size(); i++) {
+		if (p_path.matchn(p_in[i]) || p_path.trim_prefix("res://").matchn(p_in[i])) {
+			encrypt = true;
+			break;
+		}
+	}
+	for (int i = 0; i < p_ex.size(); i++) {
+		if (p_path.matchn(p_ex[i]) || p_path.trim_prefix("res://").matchn(p_ex[i])) {
+			encrypt = false;
+			break;
+		}
+	}
+	return encrypt;
+}
+
+Error _capture_project_file(void *p_userdata, const String &p_path, const Vector<uint8_t> &p_data, int, int, const Vector<String> &, const Vector<String> &, const Vector<uint8_t> &, uint64_t) {
+	CapturedProject *captured = static_cast<CapturedProject *>(p_userdata);
+	String res_path = p_path.simplify_path();
+	if (res_path.begins_with("uid://")) {
+		res_path = ResourceUID::uid_to_path(res_path).simplify_path();
+	}
+	const String relative = res_path.trim_prefix("res://");
+	const String dest = captured->root.path_join(relative);
+	Ref<DirAccess> dir = DirAccess::create(DirAccess::ACCESS_FILESYSTEM);
+	if (dir->make_dir_recursive(dest.get_base_dir()) != OK) {
+		return ERR_CANT_CREATE;
+	}
+	Ref<FileAccess> out = FileAccess::open(dest, FileAccess::WRITE);
+	if (out.is_null()) {
+		return ERR_FILE_CANT_WRITE;
+	}
+	out->store_buffer(p_data.ptr(), p_data.size());
+	captured->staged[res_path] = dest;
+	WeChatProjectLayout::ResourceFile file;
+	file.path = res_path;
+	file.size = p_data.size();
+	captured->resources.push_back(file);
+	return OK;
+}
+
+Error _write_resource_pack(const String &p_path, const CapturedProject &p_captured, const HashSet<String> &p_include, bool p_encrypt, bool p_enc_dir, const String &p_key, const Vector<String> &p_in, const Vector<String> &p_ex) {
+	Ref<DirAccess> dir = DirAccess::create(DirAccess::ACCESS_FILESYSTEM);
+	if (dir->make_dir_recursive(p_path.get_base_dir()) != OK) {
+		return ERR_CANT_CREATE;
+	}
+	Ref<PCKPacker> packer;
+	packer.instantiate();
+	const String key = p_key.is_empty() ? String("0000000000000000000000000000000000000000000000000000000000000000") : p_key;
+	Error err = packer->pck_start(p_path, 32, key, p_encrypt && p_enc_dir);
+	if (err != OK) {
+		return err;
+	}
+	int added = 0;
+	for (const KeyValue<String, String> &file : p_captured.staged) {
+		if (!p_include.has(file.key)) {
+			continue;
+		}
+		err = packer->add_file(file.key, file.value, p_encrypt && _encrypt_path(file.key, p_in, p_ex));
+		if (err != OK) {
+			return err;
+		}
+		added++;
+	}
+	if (added == 0) {
+		return ERR_FILE_NOT_FOUND;
+	}
+	return packer->flush(false);
+}
+
+ShellTexts _build_shell(const String &p_template, const WeChatProjectLayout::Plan &p_plan, const String &p_project_name, int p_orientation, const String &p_revision, const String &p_emscripten, const String &p_wasm_name, const Vector<WeChatProjectLayout::ResourceGroupPlan> &p_groups, int64_t p_budget_bytes) {
 	const String root = p_plan.use_runtime_subpackage ? String(WeChatProjectLayout::RUNTIME_SUBPACKAGE_ROOT) + "/" : String();
 	HashMap<String, String> replaces;
 	replaces["___GODOT_MIN_BASE_LIBRARY___"] = _js_literal(WeChatProjectLayout::MIN_BASE_LIBRARY);
@@ -238,13 +360,14 @@ ShellTexts _build_shell(const String &p_template, const WeChatProjectLayout::Pla
 	replaces["___GODOT_REVISION___"] = _js_literal(p_revision);
 	replaces["___GODOT_EMSCRIPTEN_VERSION___"] = _js_literal(p_emscripten);
 	replaces["___GODOT_PROJECT_NAME___"] = _js_literal(p_project_name);
+	replaces["___GODOT_RESOURCE_GROUPS___"] = JSON::stringify(WeChatProjectLayout::resource_group_manifest(p_groups));
 
 	ShellTexts shell;
 	shell.game_js = _substitute(p_template, replaces);
-	shell.game_json = _game_json(p_plan.device_orientation, p_plan.use_runtime_subpackage);
+	shell.game_json = _game_json(p_plan.device_orientation, WeChatProjectLayout::subpackage_entries(p_plan.use_runtime_subpackage, p_groups));
 	shell.project_config = _project_config(p_plan.project_appid, p_project_name, p_plan.use_runtime_subpackage);
 	shell.private_config = _private_config();
-	shell.manifest = _manifest_json(p_plan, p_project_name, p_orientation, p_revision, p_emscripten);
+	shell.manifest = _manifest_json(p_plan, p_project_name, p_orientation, p_revision, p_emscripten, p_groups, p_budget_bytes);
 	shell.bytes = shell.game_js.utf8().length() + shell.game_json.utf8().length() + shell.project_config.utf8().length() + shell.private_config.utf8().length() + shell.manifest.utf8().length();
 	if (p_plan.use_runtime_subpackage) {
 		shell.bytes += String("console.log(\"[Godot] engine runtime subpackage loaded\");\n").utf8().length();
@@ -338,6 +461,8 @@ void EditorExportPlatformWeChat::get_export_options(List<ExportOption> *r_option
 	r_options->push_back(ExportOption(PropertyInfo(Variant::STRING, "custom_template/debug", PROPERTY_HINT_GLOBAL_FILE, "*.zip"), ""));
 	r_options->push_back(ExportOption(PropertyInfo(Variant::STRING, "custom_template/release", PROPERTY_HINT_GLOBAL_FILE, "*.zip"), ""));
 	r_options->push_back(ExportOption(PropertyInfo(Variant::STRING, "wechat/appid"), ""));
+	r_options->push_back(ExportOption(PropertyInfo(Variant::INT, "wechat/total_package_budget", PROPERTY_HINT_ENUM, "20 MB (default),30 MB (eligible projects)"), 0));
+	r_options->push_back(ExportOption(PropertyInfo(Variant::STRING, "wechat/resource_groups", PROPERTY_HINT_MULTILINE_TEXT), ""));
 }
 
 bool EditorExportPlatformWeChat::get_export_option_visibility(const EditorExportPreset *p_preset, const String &p_option) const {
@@ -385,6 +510,11 @@ bool EditorExportPlatformWeChat::has_valid_project_configuration(const Ref<Edito
 	const String renderer = String(get_project_setting(p_preset, "rendering/renderer/rendering_method"));
 	if (renderer != "gl_compatibility") {
 		r_error = TTR("WeChat Mini Game requires the Compatibility renderer and WebGL 2. Set rendering/renderer/rendering_method to gl_compatibility, or set rendering/renderer/rendering_method.web to gl_compatibility.");
+		return false;
+	}
+	const String group_error = WeChatProjectLayout::validate_resource_group_text(String(p_preset->get("wechat/resource_groups")));
+	if (!group_error.is_empty()) {
+		r_error = group_error;
 		return false;
 	}
 	return true;
@@ -475,11 +605,68 @@ Error EditorExportPlatformWeChat::export_project(const Ref<EditorExportPreset> &
 		return ERR_FILE_CORRUPT;
 	}
 
+	const String group_text = String(p_preset->get("wechat/resource_groups"));
+	const bool budget_30 = int(p_preset->get("wechat/total_package_budget")) == 1;
+	const int64_t budget_bytes = WeChatProjectLayout::total_budget_limit(budget_30);
+	const String main_scene = String(get_project_setting(p_preset, "application/run/main_scene"));
 	const String pck_path = staging.path_join("game.bin");
-	Error pack_error = save_pack(p_preset, p_debug, pck_path);
-	if (pack_error != OK) {
-		add_message(EXPORT_MESSAGE_ERROR, TTR("Export"), vformat(TTR("Could not write file: \"%s\"."), pck_path));
-		return pack_error;
+	Vector<WeChatProjectLayout::ResourceGroupPlan> resource_groups;
+	Vector<WeChatProjectLayout::ResourceFile> resource_files;
+	Vector<WeChatProjectLayout::MeasuredPack> measured_packs;
+	if (!group_text.strip_edges().is_empty()) {
+		CapturedProject captured;
+		captured.root = staging.path_join("loose");
+		const Error capture_error = export_project_files(p_preset, p_debug, _capture_project_file, nullptr, &captured);
+		if (capture_error != OK) {
+			add_message(EXPORT_MESSAGE_ERROR, TTR("Export"), TTR("Could not read project resources for WeChat package groups."));
+			return capture_error;
+		}
+		const WeChatProjectLayout::ResourceAssignment assignment = WeChatProjectLayout::assign_resource_groups(group_text, captured.resources, main_scene);
+		if (!assignment.valid) {
+			add_message(EXPORT_MESSAGE_ERROR, TTR("Export"), assignment.error);
+			return ERR_INVALID_PARAMETER;
+		}
+		resource_groups = assignment.groups;
+		resource_files = captured.resources;
+		const bool encrypt = p_preset->get_enc_pck();
+		const String key = encrypt ? p_preset->get_script_encryption_key() : String();
+		const Vector<String> enc_in = _split_filter(p_preset->get_enc_in_filter());
+		const Vector<String> enc_ex = _split_filter(p_preset->get_enc_ex_filter());
+		HashSet<String> main_files;
+		for (int i = 0; i < assignment.main_resources.size(); i++) {
+			main_files.insert(assignment.main_resources[i]);
+		}
+		Error pack_error = _write_resource_pack(pck_path, captured, main_files, encrypt, p_preset->get_enc_directory(), key, enc_in, enc_ex);
+		if (pack_error != OK) {
+			add_message(EXPORT_MESSAGE_ERROR, TTR("Export"), vformat(TTR("Could not write file: \"%s\"."), pck_path));
+			return pack_error;
+		}
+		for (int i = 0; i < resource_groups.size(); i++) {
+			HashSet<String> group_files;
+			for (int j = 0; j < resource_groups[i].resources.size(); j++) {
+				group_files.insert(resource_groups[i].resources[j]);
+			}
+			const String group_pack = staging.path_join(resource_groups[i].pack);
+			pack_error = _write_resource_pack(group_pack, captured, group_files, encrypt, p_preset->get_enc_directory(), key, enc_in, enc_ex);
+			if (pack_error != OK) {
+				add_message(EXPORT_MESSAGE_ERROR, TTR("Export"), vformat(TTR("Could not write file: \"%s\"."), group_pack));
+				return pack_error;
+			}
+			WeChatProjectLayout::MeasuredPack measured;
+			measured.name = resource_groups[i].name;
+			measured.bytes = _file_size(group_pack);
+			if (measured.bytes < 0) {
+				add_message(EXPORT_MESSAGE_ERROR, TTR("Export"), vformat(TTR("Could not read runtime file: \"%s\"."), group_pack));
+				return ERR_FILE_CANT_READ;
+			}
+			measured_packs.push_back(measured);
+		}
+	} else {
+		Error pack_error = save_pack(p_preset, p_debug, pck_path);
+		if (pack_error != OK) {
+			add_message(EXPORT_MESSAGE_ERROR, TTR("Export"), vformat(TTR("Could not write file: \"%s\"."), pck_path));
+			return pack_error;
+		}
 	}
 
 	Vector<String> runtime_names;
@@ -527,17 +714,31 @@ Error EditorExportPlatformWeChat::export_project(const Ref<EditorExportPreset> &
 	without_sub.use_runtime_subpackage = false;
 	WeChatProjectLayout::Plan with_sub = without_sub;
 	with_sub.use_runtime_subpackage = true;
-	ShellTexts shell_without = _build_shell(shell_template, without_sub, safe_name, orientation, revision, emscripten_version, wasm_name);
-	ShellTexts shell_with = _build_shell(shell_template, with_sub, safe_name, orientation, revision, emscripten_version, wasm_name);
+	ShellTexts shell_without = _build_shell(shell_template, without_sub, safe_name, orientation, revision, emscripten_version, wasm_name, resource_groups, budget_bytes);
+	ShellTexts shell_with = _build_shell(shell_template, with_sub, safe_name, orientation, revision, emscripten_version, wasm_name, resource_groups, budget_bytes);
 	const int64_t host_model_bytes = host_model.utf8().length();
 	shell_without.bytes += host_model_bytes;
 	shell_with.bytes += host_model_bytes;
-	const WeChatProjectLayout::Plan plan = WeChatProjectLayout::plan_project(appid, orientation, shell_without.bytes, shell_with.bytes, runtime_files);
-	if (!plan.valid) {
-		add_message(EXPORT_MESSAGE_ERROR, TTR("Export"), plan.error);
+	const WeChatProjectLayout::PackagePlan packages = WeChatProjectLayout::plan_resource_packages(appid, orientation, shell_without.bytes, shell_with.bytes, runtime_files, group_text, resource_files, main_scene, budget_30, measured_packs);
+	if (!packages.valid) {
+		add_message(EXPORT_MESSAGE_ERROR, TTR("Export"), packages.error);
 		return ERR_INVALID_PARAMETER;
 	}
+	const WeChatProjectLayout::Plan plan = packages.project;
+	resource_groups = packages.groups;
 	const ShellTexts shell = plan.use_runtime_subpackage ? shell_with : shell_without;
+
+	Vector<String> existing_output;
+	_collect_relative_files(project_dir, String(), existing_output);
+	const Vector<String> planned_output = WeChatProjectLayout::planned_output_files(plan, resource_groups);
+	const Vector<String> stale_output = WeChatProjectLayout::stale_uploaded_files(existing_output, planned_output);
+	if (!stale_output.is_empty()) {
+		Ref<DirAccess> project = DirAccess::open(project_dir);
+		if (project.is_null() || project->erase_contents_recursive() != OK) {
+			add_message(EXPORT_MESSAGE_ERROR, TTR("Export"), vformat(TTR("Could not remove the previous WeChat export in \"%s\". Leftover resource groups would be uploaded inside the main package and are not included in the package budget."), project_dir));
+			return ERR_CANT_CREATE;
+		}
+	}
 
 	if (_write_text(project_dir.path_join("game.js"), shell.game_js) != OK ||
 			_write_text(project_dir.path_join("wechat_host_model.js"), host_model) != OK ||
@@ -583,7 +784,28 @@ Error EditorExportPlatformWeChat::export_project(const Ref<EditorExportPreset> &
 		}
 	}
 
-	print_line(vformat("WeChat Mini Game project written to %s (runtime subpackage: %s).", project_dir, plan.use_runtime_subpackage ? "yes" : "no"));
+	for (int i = 0; i < resource_groups.size(); i++) {
+		const String group_dir = project_dir.path_join(resource_groups[i].root);
+		if (dir->make_dir_recursive(group_dir) != OK) {
+			add_message(EXPORT_MESSAGE_ERROR, TTR("Export"), vformat(TTR("Could not create runtime subpackage directory: \"%s\"."), group_dir));
+			return ERR_CANT_CREATE;
+		}
+		if (_write_text(group_dir.path_join("game.js"), WeChatProjectLayout::RESOURCE_SUBPACKAGE_ENTRY) != OK) {
+			add_message(EXPORT_MESSAGE_ERROR, TTR("Export"), TTR("Could not write the runtime subpackage entry."));
+			return ERR_FILE_CANT_WRITE;
+		}
+		const String from = staging.path_join(resource_groups[i].pack);
+		const String to = project_dir.path_join(resource_groups[i].pack);
+		if (FileAccess::exists(to)) {
+			dir->remove(to);
+		}
+		if (dir->copy(from, to) != OK) {
+			add_message(EXPORT_MESSAGE_ERROR, TTR("Export"), vformat(TTR("Could not write file: \"%s\"."), to));
+			return ERR_FILE_CANT_WRITE;
+		}
+	}
+
+	print_line(vformat("WeChat Mini Game project written to %s (runtime subpackage: %s, resource groups: %d).", project_dir, plan.use_runtime_subpackage ? "yes" : "no", resource_groups.size()));
 	return OK;
 }
 

@@ -104,7 +104,7 @@ def assemble(destination: Path) -> dict:
             "___GODOT_EMSCRIPTEN_VERSION___": _emscripten(),
             "___GODOT_PROJECT_NAME___": "WeChat Boot",
         },
-    )
+    ).replace("___GODOT_RESOURCE_GROUPS___", "[]")
     game = {
         "deviceOrientation": "portrait",
         "showStatusBar": False,
@@ -144,6 +144,8 @@ def assemble(destination: Path) -> dict:
         "deviceOrientation": "portrait",
         "minBaseLibrary": MIN_BASE_LIBRARY,
         "runtimeSubpackage": RUNTIME_SUBPACKAGE_NAME if plan["use_runtime_subpackage"] else "",
+        "totalPackageBudgetBytes": 20 * 1024 * 1024,
+        "resourceGroups": [],
         "renderer": "gl_compatibility",
         "threads": False,
         "simd": False,

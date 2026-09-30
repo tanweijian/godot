@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="WeChat" inherits="Object" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Loads WeChat resource subpackages and mounts their Godot resource packs.
+	</brief_description>
+	<description>
+		Available in an exported WeChat Mini Game. Call [method load_resource_subpackage] with a group name from the export preset. Progress, success, and failure are reported by signals. The group's [code]res://[/code] resources are mounted only after WeChat finishes loading that subpackage and the resource pack is read successfully.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="load_resource_subpackage">
+			<return type="int" enum="Error" />
+			<param index="0" name="name" type="String" />
+			<description>
+				Starts loading the named project resource subpackage. Returns [constant OK] when the request is accepted or the pack is already mounted. Returns [constant ERR_DOES_NOT_EXIST] when [param name] is not in the package manifest, [constant ERR_BUSY] when that subpackage is already loading, and [constant ERR_UNAVAILABLE] when [code]wx.loadSubpackage[/code] is missing. A returned error is also reported through [signal resource_subpackage_failed], except [constant ERR_BUSY], which leaves the in-progress request unchanged.
+			</description>
+		</method>
+	</methods>
+	<signals>
+		<signal name="resource_subpackage_progress">
+			<param index="0" name="name" type="String" />
+			<param index="1" name="progress" type="float" />
+			<description>
+				Emitted while [param name] is downloading. [param progress] is the WeChat percentage from 0 to 100. The resource pack is not mounted yet.
+			</description>
+		</signal>
+		<signal name="resource_subpackage_loaded">
+			<param index="0" name="name" type="String" />
+			<description>
+				Emitted after [param name] has loaded and its Godot resource pack has been mounted. [code]res://[/code] files from that pack can be used after this signal.
+			</description>
+		</signal>
+		<signal name="resource_subpackage_failed">
+			<param index="0" name="name" type="String" />
+			<param index="1" name="message" type="String" />
+			<description>
+				Emitted when [param name] cannot be loaded or its resource pack cannot be mounted. The pack is not available.
+			</description>
+		</signal>
+	</signals>
+</class>

@@ -8,12 +8,17 @@ from project_layout import (
     MIN_BASE_LIBRARY,
     PREVIEW_APPID,
     SHELL,
+    TOTAL_PACKAGE_LIMIT_20_BYTES,
+    TOTAL_PACKAGE_LIMIT_30_BYTES,
     device_orientation_from_godot,
     host_contract_markers,
     is_valid_appid,
     plan_project,
+    plan_resource_packages,
     project_appid,
+    resource_group_manifest,
     shell_contract_markers,
+    stale_uploaded_files,
     substitute_shell,
 )
 
@@ -84,7 +89,138 @@ class WeChatProjectLayoutTest(unittest.TestCase):
         )
         self.assertIn(json.dumps("2.19.0"), rendered)
         self.assertIn(json.dumps('Quote "Game"'), rendered)
+        rendered = rendered.replace("___GODOT_RESOURCE_GROUPS___", "[]")
         self.assertNotIn("___GODOT_", rendered)
+
+    def test_resource_groups_map_to_packs_and_leave_unassigned_files_in_the_main_package(self):
+        files = [
+            ("res://levels/boss.tscn", 10),
+            ("res://ui/menu.tscn", 4),
+            ("res://audio/boss.ogg", 8),
+            ("res://music/theme.wav", 3),
+            ("res://project.binary", 20),
+            ("res://main.tscn", 6),
+        ]
+        plan = plan_resource_packages(
+            "",
+            1,
+            100,
+            120,
+            [],
+            "levels:res://levels/*\naudio:res://audio/*.ogg,res://music/*\n",
+            files,
+            "res://main.tscn",
+            False,
+        )
+        self.assertTrue(plan["valid"], plan.get("error"))
+        self.assertEqual(plan["groups"][0]["pack"], "groups/levels/pack.bin")
+        self.assertEqual(plan["groups"][0]["root"], "groups/levels/")
+        self.assertEqual(plan["groups"][0]["resources"], ["res://levels/boss.tscn"])
+        self.assertEqual(plan["groups"][1]["resources"], ["res://audio/boss.ogg", "res://music/theme.wav"])
+        self.assertIn("res://ui/menu.tscn", plan["main_resources"])
+        self.assertIn("res://main.tscn", plan["main_resources"])
+        self.assertNotIn("res://levels/boss.tscn", plan["main_resources"])
+        manifest = resource_group_manifest(plan["groups"])
+        self.assertEqual(manifest[0]["subpackage"], "levels")
+        self.assertEqual(manifest[0]["pack"], "groups/levels/pack.bin")
+        self.assertEqual(manifest[0]["resources"], ["res://levels/boss.tscn"])
+        self.assertNotIn("res://ui/menu.tscn", manifest[0]["resources"])
+        self.assertEqual(plan["total_budget_bytes"], 20971520)
+        self.assertEqual(TOTAL_PACKAGE_LIMIT_20_BYTES, 20971520)
+        self.assertEqual(TOTAL_PACKAGE_LIMIT_30_BYTES, 31457280)
+
+    def test_overlapping_groups_and_main_scene_assignment_are_rejected(self):
+        overlap = plan_resource_packages(
+            "",
+            0,
+            100,
+            120,
+            [],
+            "levels:res://shared/*\naudio:res://shared/*\n",
+            [("res://shared/a.txt", 1), ("res://project.binary", 1)],
+        )
+        self.assertFalse(overlap["valid"])
+        self.assertIn("res://shared/a.txt", overlap["error"])
+        self.assertIn("levels", overlap["error"])
+        self.assertIn("audio", overlap["error"])
+
+        main_scene = plan_resource_packages(
+            "",
+            0,
+            100,
+            120,
+            [],
+            "levels:res://main.tscn\n",
+            [("res://main.tscn", 1), ("res://project.binary", 1)],
+            "res://main.tscn",
+        )
+        self.assertFalse(main_scene["valid"])
+        self.assertIn("res://main.tscn", main_scene["error"])
+        self.assertIn("main package", main_scene["error"])
+
+    def test_total_budget_errors_name_the_selected_20_or_30_mb_limit(self):
+        files = [("res://project.binary", 1), ("res://levels/boss.tscn", 20971520)]
+        groups = "levels:res://levels/*\n"
+        over_20 = plan_resource_packages("", 0, 100, 120, [], groups, files, "", False)
+        self.assertFalse(over_20["valid"])
+        self.assertIn("20971671", over_20["error"])
+        self.assertIn("20971520", over_20["error"])
+        self.assertIn("20 MB", over_20["error"])
+
+        under_30 = plan_resource_packages("", 0, 100, 120, [], groups, files, "", True)
+        self.assertTrue(under_30["valid"], under_30.get("error"))
+        self.assertEqual(under_30["total_budget_bytes"], 31457280)
+        self.assertEqual(under_30["main_package_bytes"], 100)
+
+        over_30 = plan_resource_packages(
+            "",
+            0,
+            100,
+            120,
+            [],
+            groups,
+            [("res://project.binary", 1), ("res://levels/boss.tscn", 31457280)],
+            "",
+            True,
+        )
+        self.assertFalse(over_30["valid"])
+        self.assertIn("31457431", over_30["error"])
+        self.assertIn("31457280", over_30["error"])
+        self.assertIn("30 MB", over_30["error"])
+
+    def test_measured_pack_size_counts_toward_the_total_but_not_the_main_package(self):
+        files = [("res://project.binary", 1), ("res://levels/boss.tscn", 10)]
+        groups = "levels:res://levels/*\n"
+        plan = plan_resource_packages("", 0, 100, 120, [], groups, files, "", False, {"levels": 5 * 1024 * 1024})
+        self.assertTrue(plan["valid"], plan.get("error"))
+        self.assertEqual(plan["main_package_bytes"], 100)
+        self.assertLess(plan["main_package_bytes"], 4194304)
+        self.assertEqual(plan["groups"][0]["pack_bytes"], 5 * 1024 * 1024)
+
+        over = plan_resource_packages("", 0, 100, 120, [], groups, files, "", False, {"levels": 20971520})
+        self.assertFalse(over["valid"])
+        self.assertIn("20971671", over["error"])
+        self.assertIn("20 MB", over["error"])
+
+    def test_a_dropped_resource_group_is_not_part_of_the_next_upload(self):
+        stale = stale_uploaded_files(
+            ["game.js", "groups/old/pack.bin", "groups/old/game.js", "game.pck"],
+            ["game.js", "groups/levels/pack.bin", "groups/levels/game.js"],
+        )
+        self.assertEqual(stale, ["groups/old/pack.bin", "groups/old/game.js", "game.pck"])
+
+    def test_a_resource_group_does_not_hide_a_main_package_limit_error(self):
+        plan = plan_resource_packages(
+            "",
+            0,
+            5 * 1024 * 1024,
+            5 * 1024 * 1024,
+            [],
+            "levels:res://levels/*\n",
+            [("res://project.binary", 1), ("res://levels/boss.tscn", 10)],
+        )
+        self.assertFalse(plan["valid"])
+        self.assertIn("4 MB", plan["error"])
 
 
 if __name__ == "__main__":

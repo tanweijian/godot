@@ -138,6 +138,7 @@ extern void godot_js_display_vk_hide();
 #ifdef WECHAT_ENABLED
 extern void godot_js_display_safe_area_get(int32_t *p_rect);
 extern void godot_js_wechat_lifecycle_cb(void (*p_callback)(int p_foreground));
+extern int godot_js_wechat_load_resource_subpackage(const char *p_name, void (*p_callback)(const char *p_name, int p_event, int p_progress, const char *p_detail));
 #endif
 
 #ifdef __cplusplus

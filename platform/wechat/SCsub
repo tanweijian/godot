@@ -18,6 +18,7 @@ web_files = [
     "#platform/web/net_socket_web.cpp",
     "#platform/web/os_web.cpp",
     "#platform/web/web_runtime.cpp",
+    "#platform/wechat/wechat_runtime.cpp",
 ]
 
 build_env = env.Clone()

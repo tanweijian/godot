@@ -874,9 +874,32 @@ function createHost() {
 		return target && target.__godotWeChatCanvas ? target.__godotWeChatCanvas : null;
 	}
 
+	var boundWx = null;
+	var resourceGroups = [];
+	var resourceLoader = createResourceSubpackageLoader({
+		groups: function () {
+			return resourceGroups;
+		},
+		wx: function () {
+			return boundWx;
+		},
+		readFile: function (path) {
+			if (!boundWx || typeof boundWx.getFileSystemManager !== "function") {
+				return Promise.reject(new Error("wx.getFileSystemManager is missing. The resource pack was not mounted."));
+			}
+			return createPackageAccess(boundWx.getFileSystemManager()).readAsync(path);
+		},
+	});
+
 	var host = {
 		runtimeToken: function () {
 			return runtimeToken;
+		},
+		setResourceSubpackages: function (groups) {
+			resourceGroups = Array.isArray(groups) ? groups : [];
+		},
+		loadResourceSubpackage: function (name, observer) {
+			return resourceLoader.load(name, observer);
 		},
 		isForeground: function () {
 			return foreground;
@@ -974,6 +997,9 @@ function createHost() {
 		},
 		bind: function (target, wx) {
 			root = target || root;
+			if (wx) {
+				boundWx = wx;
+			}
 			if (root && typeof root.ontouchstart === "undefined") {
 				root.ontouchstart = null;
 			}
@@ -1401,6 +1427,99 @@ function createUserDataStore(hostFs, userDataPath) {
 	};
 }
 
+function createResourceSubpackageLoader(options) {
+	var groupsOf = typeof options.groups === "function" ? options.groups : function () {
+		return options.groups || [];
+	};
+	var wxOf = typeof options.wx === "function" ? options.wx : function () {
+		return options.wx;
+	};
+	var readFile = options.readFile;
+	var state = {};
+
+	function find(name) {
+		var groups = groupsOf() || [];
+		for (var i = 0; i < groups.length; i++) {
+			if (groups[i] && groups[i].name === name) {
+				return groups[i];
+			}
+		}
+		return null;
+	}
+
+	function fail(observer, message) {
+		if (observer && observer.failure) {
+			observer.failure(message);
+		}
+	}
+
+	return {
+		load: function (name, observer) {
+			var group = find(name);
+			if (!group) {
+				fail(observer, "WeChat resource subpackage \"" + name + "\" is not in the package manifest.");
+				return 1;
+			}
+			if (state[name] === "loading") {
+				fail(observer, "WeChat resource subpackage \"" + name + "\" is already loading.");
+				return 3;
+			}
+			var wx = wxOf();
+			if (!wx || typeof wx.loadSubpackage !== "function") {
+				fail(observer, "wx.loadSubpackage is missing. WeChat base library 2.1.0 or newer is required to load resource subpackage \"" + name + "\". The resource pack was not mounted.");
+				return 2;
+			}
+			state[name] = "loading";
+			var task = wx.loadSubpackage({
+				name: group.subpackage,
+				success: function () {
+					if (state[name] !== "loading") {
+						return;
+					}
+					Promise.resolve()
+						.then(function () {
+							return readFile(group.pack);
+						})
+						.then(function (bytes) {
+							if (state[name] !== "loading") {
+								return;
+							}
+							state[name] = "loaded";
+							if (observer && observer.success) {
+								observer.success(bytes);
+							}
+						}, function (error) {
+							if (state[name] !== "loading") {
+								return;
+							}
+							delete state[name];
+							var detail = error && error.message ? error.message : error;
+							fail(observer, "WeChat resource subpackage \"" + name + "\" loaded, but its resource pack \"" + group.pack + "\" could not be read: " + detail + ". The pack was not mounted.");
+						});
+				},
+				fail: function (error) {
+					if (state[name] !== "loading") {
+						return;
+					}
+					delete state[name];
+					var detail = error && error.errMsg ? error.errMsg : error;
+					fail(observer, "Failed to load WeChat resource subpackage \"" + name + "\": " + detail + ". Its resource pack was not mounted.");
+				},
+			});
+			if (task && task.onProgressUpdate) {
+				task.onProgressUpdate(function (progress) {
+					if (state[name] !== "loading" || !observer || !observer.progress) {
+						return;
+					}
+					var percent = progress && typeof progress.progress === "number" ? progress.progress : 0;
+					observer.progress(percent);
+				});
+			}
+			return 0;
+		},
+	};
+}
+
 function createPackageAccess(hostFs) {
 	function rejectWrite(action, path) {
 		return fileFailure(action, path, "code package resources are read-only in a WeChat Mini Game", "ERR_FILE_NO_PERMISSION");
@@ -1682,6 +1801,7 @@ var api = {
 	createGodotFiles: createGodotFiles,
 	createHost: createHost,
 	createPackageAccess: createPackageAccess,
+	createResourceSubpackageLoader: createResourceSubpackageLoader,
 	createUserDataStore: createUserDataStore,
 	cssRect: cssRect,
 	diagnoseRendererMessage: diagnoseRendererMessage,

@@ -12,6 +12,7 @@ var GODOT_PCK_PATH = ___GODOT_PCK_PATH___;
 var GODOT_REVISION = ___GODOT_REVISION___;
 var GODOT_EMSCRIPTEN = ___GODOT_EMSCRIPTEN_VERSION___;
 var GODOT_PROJECT_NAME = ___GODOT_PROJECT_NAME___;
+var GODOT_RESOURCE_GROUPS = ___GODOT_RESOURCE_GROUPS___;
 var WeChatHost = require("./wechat_host_model.js");
 
 function godotWeChatRoot() {
@@ -439,7 +440,9 @@ function godotWeChatBoot() {
 	}
 	godotWeChatApplyWindowMetrics();
 	godotWeChatPrepareCanvas();
-	godotWeChatHost().bind(godotWeChatRoot(), wx);
+	var host = godotWeChatHost();
+	host.setResourceSubpackages(GODOT_RESOURCE_GROUPS);
+	host.bind(godotWeChatRoot(), wx);
 	if (!godotWeChatProbeWebGL2()) {
 		return;
 	}

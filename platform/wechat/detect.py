@@ -26,6 +26,7 @@ def get_opts():
 def get_doc_classes():
     return [
         "EditorExportPlatformWeChat",
+        "WeChat",
     ]
 
 
