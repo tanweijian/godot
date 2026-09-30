@@ -104,7 +104,7 @@ def assemble(destination: Path) -> dict:
             "___GODOT_EMSCRIPTEN_VERSION___": _emscripten(),
             "___GODOT_PROJECT_NAME___": "WeChat Boot",
         },
-    ).replace("___GODOT_RESOURCE_GROUPS___", "[]")
+    ).replace("___GODOT_RESOURCE_GROUPS___", "[]").replace("___GODOT_REQUEST_DOMAINS___", "[]").replace("___GODOT_SOCKET_DOMAINS___", "[]")
     game = {
         "deviceOrientation": "portrait",
         "showStatusBar": False,

@@ -508,4 +508,214 @@ inline PackagePlan plan_resource_packages(const String &p_appid, int p_godot_ori
 	return package;
 }
 
+inline constexpr char NETWORK_CONSOLE_PATH[] = "微信公众平台 > 开发 > 开发管理 > 开发设置 > 服务器域名";
+
+struct NetworkDomains {
+	bool valid = false;
+	String error;
+	Vector<String> request_domains;
+	Vector<String> socket_domains;
+	String reminder;
+};
+
+inline String network_allowlist_reminder(const Vector<String> &p_request_domains, const Vector<String> &p_socket_domains) {
+	// String(const char *) is Latin-1. The console path is UTF-8.
+	String text = String::utf8("Configure request and WebSocket domains in the WeChat developer console under ") + String::utf8(NETWORK_CONSOLE_PATH) + String::utf8(". Put HTTPS origins in request合法域名 and WSS hosts in socket合法域名. Request entries must not include a path or the default port 443. Socket entries must not include a path or port. This exporter cannot configure or verify those allowlists. The generated project leaves urlCheck disabled, so Developer Tools skips the allowlist; real devices still enforce it.");
+	if (!p_request_domains.is_empty() || !p_socket_domains.is_empty()) {
+		text += " Request domains: ";
+		text += p_request_domains.is_empty() ? String("(none)") : String(", ").join(p_request_domains);
+		text += ". Socket domains: ";
+		text += p_socket_domains.is_empty() ? String("(none)") : String(", ").join(p_socket_domains);
+		text += ".";
+	} else {
+		text += " No request or WebSocket domains were entered. Add them to wechat/request_domains and wechat/socket_domains before release if the game uses HTTPRequest or WebSocketPeer.";
+	}
+	return text;
+}
+
+inline String _network_domain_error(const String &p_entry, const String &p_problem) {
+	return vformat(String::utf8("WeChat domain \"%s\" is not valid: %s Add the corrected entry in %s. The exporter cannot configure or verify that allowlist."), p_entry, p_problem, String::utf8(NETWORK_CONSOLE_PATH));
+}
+
+inline bool _is_ip_host(const String &p_host) {
+	String bare = p_host;
+	if (bare.begins_with("[") && bare.ends_with("]")) {
+		bare = bare.substr(1, bare.length() - 2);
+	}
+	return bare.is_valid_ip_address();
+}
+
+inline bool _valid_network_port(const String &p_port, int &r_port) {
+	if (p_port.is_empty() || !p_port.is_valid_int()) {
+		return false;
+	}
+	if (p_port != String::num_int64(p_port.to_int())) {
+		return false;
+	}
+	r_port = p_port.to_int();
+	return r_port >= 1 && r_port <= 65535;
+}
+
+inline String _normalize_network_domain(const String &p_entry, const String &p_kind, String &r_error) {
+	const int scheme_end = p_entry.find("://");
+	if (scheme_end <= 0) {
+		r_error = _network_domain_error(p_entry, "enter an https:// request origin or a wss:// socket host.");
+		return String();
+	}
+	const String scheme = p_entry.substr(0, scheme_end).to_lower();
+	const String after = p_entry.substr(scheme_end + 3);
+	if (after.is_empty() || after.contains("@")) {
+		r_error = _network_domain_error(p_entry, "enter a host without user info.");
+		return String();
+	}
+	int cut = after.length();
+	const int slash = after.find("/");
+	const int question = after.find("?");
+	const int hash = after.find("#");
+	if (slash >= 0) {
+		cut = MIN(cut, slash);
+	}
+	if (question >= 0) {
+		cut = MIN(cut, question);
+	}
+	if (hash >= 0) {
+		cut = MIN(cut, hash);
+	}
+	const String rest = after.substr(cut);
+	const String authority = after.substr(0, cut);
+	if (authority.is_empty()) {
+		r_error = _network_domain_error(p_entry, "enter a host name.");
+		return String();
+	}
+	String host = authority;
+	String port;
+	if (authority.begins_with("[")) {
+		const int end = authority.find("]");
+		if (end < 0) {
+			r_error = _network_domain_error(p_entry, "enter a host name.");
+			return String();
+		}
+		host = authority.substr(0, end + 1);
+		if (authority.length() > end + 1) {
+			if (authority[end + 1] != ':') {
+				r_error = _network_domain_error(p_entry, "enter a host name.");
+				return String();
+			}
+			port = authority.substr(end + 2);
+		}
+	} else {
+		const int colon = authority.rfind(":");
+		if (colon >= 0) {
+			host = authority.substr(0, colon);
+			port = authority.substr(colon + 1);
+		}
+	}
+	host = host.to_lower();
+	if (p_kind == "request" && scheme == "wss") {
+		r_error = _network_domain_error(p_entry, "this is a WebSocket domain. Enter it in wechat/socket_domains, not request domains.");
+		return String();
+	}
+	if (p_kind == "socket" && scheme == "https") {
+		r_error = _network_domain_error(p_entry, "this is an HTTP request domain. Enter it in wechat/request_domains, not socket domains.");
+		return String();
+	}
+	if (p_kind == "request" && scheme != "https") {
+		r_error = _network_domain_error(p_entry, "request allowlist entries must use https://, for example https://api.example.com.");
+		return String();
+	}
+	if (p_kind == "socket" && scheme != "wss") {
+		r_error = _network_domain_error(p_entry, "socket allowlist entries must use wss://, for example wss://realtime.example.com.");
+		return String();
+	}
+	if (rest != String() && rest != "/") {
+		r_error = _network_domain_error(p_entry, "allowlist entries cannot include a path, query, or fragment.");
+		return String();
+	}
+	int port_number = 0;
+	if (!port.is_empty() && !_valid_network_port(port, port_number)) {
+		r_error = _network_domain_error(p_entry, "enter a numeric port from 1 to 65535, or omit the port.");
+		return String();
+	}
+	if (p_kind == "request" && port == "443") {
+		r_error = _network_domain_error(p_entry, "omit the default port 443. https://host:443 is not the same allowlist entry as https://host.");
+		return String();
+	}
+	if (p_kind == "socket" && !port.is_empty()) {
+		r_error = _network_domain_error(p_entry, "socket allowlist entries must not include a port. Enter wss://host and WeChat allows every port on that host.");
+		return String();
+	}
+	if (_is_ip_host(host) || host == "localhost") {
+		const String label = p_kind == "request" ? String::utf8("request合法域名") : String::utf8("socket合法域名");
+		r_error = _network_domain_error(p_entry, label + " cannot be an IP address or localhost.");
+		return String();
+	}
+	if (host.contains("*")) {
+		const String label = p_kind == "request" ? String::utf8("request合法域名") : String::utf8("socket合法域名");
+		r_error = _network_domain_error(p_entry, label + " does not accept a wildcard parent domain. Enter each subdomain separately.");
+		return String();
+	}
+	String bare_host = host.trim_prefix("[").trim_suffix("]");
+	if (!bare_host.contains(".")) {
+		r_error = _network_domain_error(p_entry, "enter a domain name, not a single-label host.");
+		return String();
+	}
+	String normalized = scheme + "://" + host;
+	if (p_kind == "request" && !port.is_empty()) {
+		normalized += ":" + port;
+	}
+	return normalized;
+}
+
+inline Vector<String> _split_network_entries(const String &p_text) {
+	Vector<String> entries;
+	String text = p_text.replace("\r\n", "\n").replace("\r", "\n");
+	const Vector<String> lines = text.split("\n", false);
+	for (int i = 0; i < lines.size(); i++) {
+		const String line = lines[i].strip_edges();
+		if (line.is_empty() || line.begins_with("#")) {
+			continue;
+		}
+		const Vector<String> parts = line.split(",", false);
+		for (int j = 0; j < parts.size(); j++) {
+			const String token = parts[j].strip_edges();
+			if (!token.is_empty()) {
+				entries.push_back(token);
+			}
+		}
+	}
+	return entries;
+}
+
+inline String _collect_network_domains(const String &p_text, const String &p_kind, Vector<String> &r_domains) {
+	const Vector<String> entries = _split_network_entries(p_text);
+	for (int i = 0; i < entries.size(); i++) {
+		String error;
+		const String normalized = _normalize_network_domain(entries[i], p_kind, error);
+		if (!error.is_empty()) {
+			r_domains.clear();
+			return error;
+		}
+		if (!r_domains.has(normalized)) {
+			r_domains.push_back(normalized);
+		}
+	}
+	return String();
+}
+
+inline NetworkDomains plan_network_domains(const String &p_request_text, const String &p_socket_text) {
+	NetworkDomains plan;
+	plan.error = _collect_network_domains(p_request_text, "request", plan.request_domains);
+	if (!plan.error.is_empty()) {
+		return plan;
+	}
+	plan.error = _collect_network_domains(p_socket_text, "socket", plan.socket_domains);
+	if (!plan.error.is_empty()) {
+		plan.request_domains.clear();
+		return plan;
+	}
+	plan.reminder = network_allowlist_reminder(plan.request_domains, plan.socket_domains);
+	plan.valid = true;
+	return plan;
+}
+
 } // namespace WeChatProjectLayout

@@ -219,7 +219,7 @@ String _private_config() {
 	return JSON::stringify(config, "\t", false, true);
 }
 
-String _manifest_json(const WeChatProjectLayout::Plan &p_plan, const String &p_project_name, int p_orientation, const String &p_revision, const String &p_emscripten, const Vector<WeChatProjectLayout::ResourceGroupPlan> &p_groups, int64_t p_budget_bytes) {
+String _manifest_json(const WeChatProjectLayout::Plan &p_plan, const String &p_project_name, int p_orientation, const String &p_revision, const String &p_emscripten, const Vector<WeChatProjectLayout::ResourceGroupPlan> &p_groups, int64_t p_budget_bytes, const WeChatProjectLayout::NetworkDomains &p_network) {
 	Dictionary manifest;
 	manifest["format"] = 1;
 	manifest["projectName"] = p_project_name;
@@ -232,6 +232,17 @@ String _manifest_json(const WeChatProjectLayout::Plan &p_plan, const String &p_p
 	manifest["totalPackageBudgetBytes"] = p_budget_bytes;
 	manifest["resourceGroups"] = WeChatProjectLayout::resource_group_manifest(p_groups);
 	manifest["runtimeSubpackage"] = p_plan.use_runtime_subpackage ? String(WeChatProjectLayout::RUNTIME_SUBPACKAGE_NAME) : String();
+	Array request_domains;
+	for (int i = 0; i < p_network.request_domains.size(); i++) {
+		request_domains.push_back(p_network.request_domains[i]);
+	}
+	Array socket_domains;
+	for (int i = 0; i < p_network.socket_domains.size(); i++) {
+		socket_domains.push_back(p_network.socket_domains[i]);
+	}
+	manifest["requestDomains"] = request_domains;
+	manifest["socketDomains"] = socket_domains;
+	manifest["networkAllowlistReminder"] = p_network.reminder;
 	manifest["renderer"] = "gl_compatibility";
 	manifest["threads"] = false;
 	manifest["simd"] = false;
@@ -348,7 +359,7 @@ Error _write_resource_pack(const String &p_path, const CapturedProject &p_captur
 	return packer->flush(false);
 }
 
-ShellTexts _build_shell(const String &p_template, const WeChatProjectLayout::Plan &p_plan, const String &p_project_name, int p_orientation, const String &p_revision, const String &p_emscripten, const String &p_wasm_name, const Vector<WeChatProjectLayout::ResourceGroupPlan> &p_groups, int64_t p_budget_bytes) {
+ShellTexts _build_shell(const String &p_template, const WeChatProjectLayout::Plan &p_plan, const String &p_project_name, int p_orientation, const String &p_revision, const String &p_emscripten, const String &p_wasm_name, const Vector<WeChatProjectLayout::ResourceGroupPlan> &p_groups, int64_t p_budget_bytes, const WeChatProjectLayout::NetworkDomains &p_network) {
 	const String root = p_plan.use_runtime_subpackage ? String(WeChatProjectLayout::RUNTIME_SUBPACKAGE_ROOT) + "/" : String();
 	HashMap<String, String> replaces;
 	replaces["___GODOT_MIN_BASE_LIBRARY___"] = _js_literal(WeChatProjectLayout::MIN_BASE_LIBRARY);
@@ -361,13 +372,23 @@ ShellTexts _build_shell(const String &p_template, const WeChatProjectLayout::Pla
 	replaces["___GODOT_EMSCRIPTEN_VERSION___"] = _js_literal(p_emscripten);
 	replaces["___GODOT_PROJECT_NAME___"] = _js_literal(p_project_name);
 	replaces["___GODOT_RESOURCE_GROUPS___"] = JSON::stringify(WeChatProjectLayout::resource_group_manifest(p_groups));
+	Array request_domains;
+	for (int i = 0; i < p_network.request_domains.size(); i++) {
+		request_domains.push_back(p_network.request_domains[i]);
+	}
+	Array socket_domains;
+	for (int i = 0; i < p_network.socket_domains.size(); i++) {
+		socket_domains.push_back(p_network.socket_domains[i]);
+	}
+	replaces["___GODOT_REQUEST_DOMAINS___"] = JSON::stringify(request_domains);
+	replaces["___GODOT_SOCKET_DOMAINS___"] = JSON::stringify(socket_domains);
 
 	ShellTexts shell;
 	shell.game_js = _substitute(p_template, replaces);
 	shell.game_json = _game_json(p_plan.device_orientation, WeChatProjectLayout::subpackage_entries(p_plan.use_runtime_subpackage, p_groups));
 	shell.project_config = _project_config(p_plan.project_appid, p_project_name, p_plan.use_runtime_subpackage);
 	shell.private_config = _private_config();
-	shell.manifest = _manifest_json(p_plan, p_project_name, p_orientation, p_revision, p_emscripten, p_groups, p_budget_bytes);
+	shell.manifest = _manifest_json(p_plan, p_project_name, p_orientation, p_revision, p_emscripten, p_groups, p_budget_bytes, p_network);
 	shell.bytes = shell.game_js.utf8().length() + shell.game_json.utf8().length() + shell.project_config.utf8().length() + shell.private_config.utf8().length() + shell.manifest.utf8().length();
 	if (p_plan.use_runtime_subpackage) {
 		shell.bytes += String("console.log(\"[Godot] engine runtime subpackage loaded\");\n").utf8().length();
@@ -463,6 +484,8 @@ void EditorExportPlatformWeChat::get_export_options(List<ExportOption> *r_option
 	r_options->push_back(ExportOption(PropertyInfo(Variant::STRING, "wechat/appid"), ""));
 	r_options->push_back(ExportOption(PropertyInfo(Variant::INT, "wechat/total_package_budget", PROPERTY_HINT_ENUM, "20 MB (default),30 MB (eligible projects)"), 0));
 	r_options->push_back(ExportOption(PropertyInfo(Variant::STRING, "wechat/resource_groups", PROPERTY_HINT_MULTILINE_TEXT), ""));
+	r_options->push_back(ExportOption(PropertyInfo(Variant::STRING, "wechat/request_domains", PROPERTY_HINT_MULTILINE_TEXT), ""));
+	r_options->push_back(ExportOption(PropertyInfo(Variant::STRING, "wechat/socket_domains", PROPERTY_HINT_MULTILINE_TEXT), ""));
 }
 
 bool EditorExportPlatformWeChat::get_export_option_visibility(const EditorExportPreset *p_preset, const String &p_option) const {
@@ -515,6 +538,11 @@ bool EditorExportPlatformWeChat::has_valid_project_configuration(const Ref<Edito
 	const String group_error = WeChatProjectLayout::validate_resource_group_text(String(p_preset->get("wechat/resource_groups")));
 	if (!group_error.is_empty()) {
 		r_error = group_error;
+		return false;
+	}
+	const WeChatProjectLayout::NetworkDomains network = WeChatProjectLayout::plan_network_domains(String(p_preset->get("wechat/request_domains")), String(p_preset->get("wechat/socket_domains")));
+	if (!network.valid) {
+		r_error = network.error;
 		return false;
 	}
 	return true;
@@ -714,8 +742,13 @@ Error EditorExportPlatformWeChat::export_project(const Ref<EditorExportPreset> &
 	without_sub.use_runtime_subpackage = false;
 	WeChatProjectLayout::Plan with_sub = without_sub;
 	with_sub.use_runtime_subpackage = true;
-	ShellTexts shell_without = _build_shell(shell_template, without_sub, safe_name, orientation, revision, emscripten_version, wasm_name, resource_groups, budget_bytes);
-	ShellTexts shell_with = _build_shell(shell_template, with_sub, safe_name, orientation, revision, emscripten_version, wasm_name, resource_groups, budget_bytes);
+	const WeChatProjectLayout::NetworkDomains network = WeChatProjectLayout::plan_network_domains(String(p_preset->get("wechat/request_domains")), String(p_preset->get("wechat/socket_domains")));
+	if (!network.valid) {
+		add_message(EXPORT_MESSAGE_ERROR, TTR("Export"), network.error);
+		return ERR_INVALID_PARAMETER;
+	}
+	ShellTexts shell_without = _build_shell(shell_template, without_sub, safe_name, orientation, revision, emscripten_version, wasm_name, resource_groups, budget_bytes, network);
+	ShellTexts shell_with = _build_shell(shell_template, with_sub, safe_name, orientation, revision, emscripten_version, wasm_name, resource_groups, budget_bytes, network);
 	const int64_t host_model_bytes = host_model.utf8().length();
 	shell_without.bytes += host_model_bytes;
 	shell_with.bytes += host_model_bytes;
@@ -806,6 +839,8 @@ Error EditorExportPlatformWeChat::export_project(const Ref<EditorExportPreset> &
 	}
 
 	print_line(vformat("WeChat Mini Game project written to %s (runtime subpackage: %s, resource groups: %d).", project_dir, plan.use_runtime_subpackage ? "yes" : "no", resource_groups.size()));
+	add_message(EXPORT_MESSAGE_WARNING, TTR("Network"), network.reminder);
+	print_line(network.reminder);
 	return OK;
 }
 

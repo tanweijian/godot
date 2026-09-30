@@ -13,6 +13,8 @@ var GODOT_REVISION = ___GODOT_REVISION___;
 var GODOT_EMSCRIPTEN = ___GODOT_EMSCRIPTEN_VERSION___;
 var GODOT_PROJECT_NAME = ___GODOT_PROJECT_NAME___;
 var GODOT_RESOURCE_GROUPS = ___GODOT_RESOURCE_GROUPS___;
+var GODOT_REQUEST_DOMAINS = ___GODOT_REQUEST_DOMAINS___;
+var GODOT_SOCKET_DOMAINS = ___GODOT_SOCKET_DOMAINS___;
 var WeChatHost = require("./wechat_host_model.js");
 
 function godotWeChatRoot() {
@@ -409,6 +411,7 @@ function godotWeChatRecordBaseline() {
 function godotWeChatBoot() {
 	console.log("[Godot] WeChat Mini Game startup");
 	console.log("[Godot] project=" + GODOT_PROJECT_NAME + " revision=" + GODOT_REVISION + " emscripten=" + GODOT_EMSCRIPTEN + " threads=no simd=no");
+	console.log("[Godot] " + WeChatHost.networkAllowlistReminder(GODOT_REQUEST_DOMAINS, GODOT_SOCKET_DOMAINS));
 	if (typeof wx === "undefined") {
 		godotWeChatFail(
 			"WeChat host missing",

@@ -343,6 +343,155 @@ def substitute_shell(template: str, values: dict[str, str]) -> str:
     return text
 
 
+NETWORK_CONSOLE_PATH = "微信公众平台 > 开发 > 开发管理 > 开发设置 > 服务器域名"
+
+
+def network_allowlist_reminder(request_domains: list[str], socket_domains: list[str]) -> str:
+    text = (
+        "Configure request and WebSocket domains in the WeChat developer console under "
+        + NETWORK_CONSOLE_PATH
+        + ". Put HTTPS origins in request合法域名 and WSS hosts in socket合法域名. "
+        "Request entries must not include a path or the default port 443. "
+        "Socket entries must not include a path or port. "
+        "This exporter cannot configure or verify those allowlists. "
+        "The generated project leaves urlCheck disabled, so Developer Tools skips the allowlist; real devices still enforce it."
+    )
+    if request_domains or socket_domains:
+        text += " Request domains: " + (", ".join(request_domains) if request_domains else "(none)") + "."
+        text += " Socket domains: " + (", ".join(socket_domains) if socket_domains else "(none)") + "."
+    else:
+        text += (
+            " No request or WebSocket domains were entered. Add them to wechat/request_domains and "
+            "wechat/socket_domains before release if the game uses HTTPRequest or WebSocketPeer."
+        )
+    return text
+
+
+def _network_domain_error(entry: str, problem: str) -> str:
+    return (
+        f'WeChat domain "{entry}" is not valid: {problem} '
+        f"Add the corrected entry in {NETWORK_CONSOLE_PATH}. "
+        "The exporter cannot configure or verify that allowlist."
+    )
+
+
+def _split_network_entries(text: str) -> list[str]:
+    entries: list[str] = []
+    for raw in str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        for part in line.split(","):
+            token = part.strip()
+            if token:
+                entries.append(token)
+    return entries
+
+
+def _is_ip_host(host: str) -> bool:
+    bare = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    if bare.count(":") >= 2:
+        return True
+    parts = bare.split(".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        if not part.isdigit() or int(part) > 255:
+            return False
+    return True
+
+
+def _normalize_network_domain(entry: str, kind: str) -> tuple[str, str]:
+    scheme_end = entry.find("://")
+    if scheme_end <= 0:
+        return "", _network_domain_error(entry, "enter an https:// request origin or a wss:// socket host.")
+    scheme = entry[:scheme_end].lower()
+    after = entry[scheme_end + 3 :]
+    if not after or "@" in after:
+        return "", _network_domain_error(entry, "enter a host without user info.")
+    cut = len(after)
+    for marker in ("/", "?", "#"):
+        found = after.find(marker)
+        if found >= 0:
+            cut = min(cut, found)
+    rest = after[cut:]
+    authority = after[:cut]
+    if not authority:
+        return "", _network_domain_error(entry, "enter a host name.")
+    host = authority
+    port = ""
+    if authority.startswith("["):
+        end = authority.find("]")
+        if end < 0:
+            return "", _network_domain_error(entry, "enter a host name.")
+        host = authority[: end + 1]
+        if len(authority) > end + 1:
+            if authority[end + 1] != ":":
+                return "", _network_domain_error(entry, "enter a host name.")
+            port = authority[end + 2 :]
+    else:
+        colon = authority.rfind(":")
+        if colon >= 0:
+            host = authority[:colon]
+            port = authority[colon + 1 :]
+    host = host.lower()
+    if kind == "request" and scheme == "wss":
+        return "", _network_domain_error(entry, "this is a WebSocket domain. Enter it in wechat/socket_domains, not request domains.")
+    if kind == "socket" and scheme == "https":
+        return "", _network_domain_error(entry, "this is an HTTP request domain. Enter it in wechat/request_domains, not socket domains.")
+    if kind == "request" and scheme != "https":
+        return "", _network_domain_error(entry, "request allowlist entries must use https://, for example https://api.example.com.")
+    if kind == "socket" and scheme != "wss":
+        return "", _network_domain_error(entry, "socket allowlist entries must use wss://, for example wss://realtime.example.com.")
+    if rest not in ("", "/"):
+        return "", _network_domain_error(entry, "allowlist entries cannot include a path, query, or fragment.")
+    if port and (not port.isdigit() or port != str(int(port)) or int(port) < 1 or int(port) > 65535):
+        return "", _network_domain_error(entry, "enter a numeric port from 1 to 65535, or omit the port.")
+    if kind == "request" and port == "443":
+        return "", _network_domain_error(entry, "omit the default port 443. https://host:443 is not the same allowlist entry as https://host.")
+    if kind == "socket" and port:
+        return "", _network_domain_error(entry, "socket allowlist entries must not include a port. Enter wss://host and WeChat allows every port on that host.")
+    if _is_ip_host(host) or host == "localhost":
+        label = "request合法域名" if kind == "request" else "socket合法域名"
+        return "", _network_domain_error(entry, f"{label} cannot be an IP address or localhost.")
+    if "*" in host:
+        label = "request合法域名" if kind == "request" else "socket合法域名"
+        return "", _network_domain_error(entry, f"{label} does not accept a wildcard parent domain. Enter each subdomain separately.")
+    if "." not in host.strip("[]"):
+        return "", _network_domain_error(entry, "enter a domain name, not a single-label host.")
+    normalized = scheme + "://" + host
+    if kind == "request" and port:
+        normalized += ":" + port
+    return normalized, ""
+
+
+def _collect_network_domains(text: str, kind: str) -> tuple[list[str], str]:
+    domains: list[str] = []
+    for entry in _split_network_entries(text):
+        normalized, error = _normalize_network_domain(entry, kind)
+        if error:
+            return [], error
+        if normalized not in domains:
+            domains.append(normalized)
+    return domains, ""
+
+
+def plan_network_domains(request_text: str, socket_text: str) -> dict:
+    request_domains, request_error = _collect_network_domains(request_text, "request")
+    if request_error:
+        return {"valid": False, "error": request_error, "request_domains": [], "socket_domains": [], "reminder": ""}
+    socket_domains, socket_error = _collect_network_domains(socket_text, "socket")
+    if socket_error:
+        return {"valid": False, "error": socket_error, "request_domains": [], "socket_domains": [], "reminder": ""}
+    return {
+        "valid": True,
+        "error": "",
+        "request_domains": request_domains,
+        "socket_domains": socket_domains,
+        "reminder": network_allowlist_reminder(request_domains, socket_domains),
+    }
+
+
 def shell_contract_markers() -> list[str]:
     return [
         "2.19.0",
@@ -358,6 +507,9 @@ def shell_contract_markers() -> list[str]:
         "godotWeChatCompareVersion",
         "setResourceSubpackages",
         "GODOT_RESOURCE_GROUPS",
+        "GODOT_REQUEST_DOMAINS",
+        "GODOT_SOCKET_DOMAINS",
+        "networkAllowlistReminder",
         "--main-pack",
         'require("./wechat_host_model.js")',
         "createGodotFiles",
@@ -378,4 +530,6 @@ def host_contract_markers() -> list[str]:
         "safeArea",
         "loadResourceSubpackage",
         "setResourceSubpackages",
+        "wx.request",
+        "wx.connectSocket",
     ]

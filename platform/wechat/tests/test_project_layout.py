@@ -13,6 +13,7 @@ from project_layout import (
     device_orientation_from_godot,
     host_contract_markers,
     is_valid_appid,
+    plan_network_domains,
     plan_project,
     plan_resource_packages,
     project_appid,
@@ -90,6 +91,8 @@ class WeChatProjectLayoutTest(unittest.TestCase):
         self.assertIn(json.dumps("2.19.0"), rendered)
         self.assertIn(json.dumps('Quote "Game"'), rendered)
         rendered = rendered.replace("___GODOT_RESOURCE_GROUPS___", "[]")
+        rendered = rendered.replace("___GODOT_REQUEST_DOMAINS___", "[]")
+        rendered = rendered.replace("___GODOT_SOCKET_DOMAINS___", "[]")
         self.assertNotIn("___GODOT_", rendered)
 
     def test_resource_groups_map_to_packs_and_leave_unassigned_files_in_the_main_package(self):
@@ -221,6 +224,54 @@ class WeChatProjectLayoutTest(unittest.TestCase):
         )
         self.assertFalse(plan["valid"])
         self.assertIn("4 MB", plan["error"])
+
+    def test_export_collects_request_and_socket_domains_and_reminds_about_the_console(self):
+        plan = plan_network_domains(
+            "https://API.Example.com/\nhttps://cdn.example.com:8443\n# comment\nhttps://api.example.com, https://cdn.example.com:8443\n",
+            "wss://Realtime.Example.com\n",
+        )
+        self.assertTrue(plan["valid"], plan.get("error"))
+        self.assertEqual(plan["request_domains"], ["https://api.example.com", "https://cdn.example.com:8443"])
+        self.assertEqual(plan["socket_domains"], ["wss://realtime.example.com"])
+        for phrase in (
+            "https://api.example.com",
+            "https://cdn.example.com:8443",
+            "wss://realtime.example.com",
+            "request合法域名",
+            "socket合法域名",
+            "微信公众平台 > 开发 > 开发管理 > 开发设置 > 服务器域名",
+            "cannot configure or verify",
+            "443",
+            "urlCheck",
+        ):
+            self.assertIn(phrase, plan["reminder"])
+
+        empty = plan_network_domains("", "   \n# none\n")
+        self.assertTrue(empty["valid"], empty.get("error"))
+        self.assertEqual(empty["request_domains"], [])
+        self.assertEqual(empty["socket_domains"], [])
+        self.assertIn("wechat/request_domains", empty["reminder"])
+        self.assertIn("wechat/socket_domains", empty["reminder"])
+        self.assertIn("cannot configure or verify", empty["reminder"])
+
+    def test_invalid_domain_entries_explain_how_to_fix_the_allowlist(self):
+        cases = [
+            ("http://api.example.com", "", "http://api.example.com", "https://"),
+            ("https://api.example.com/v1", "", "https://api.example.com/v1", "path"),
+            ("https://api.example.com:443", "", "https://api.example.com:443", "443"),
+            ("https://127.0.0.1", "", "127.0.0.1", "request合法域名"),
+            ("https://*.example.com", "", "*.example.com", "request合法域名"),
+            ("", "ws://realtime.example.com", "ws://realtime.example.com", "wss://"),
+            ("", "wss://realtime.example.com:9001", "wss://realtime.example.com:9001", "port"),
+            ("wss://realtime.example.com", "", "wss://realtime.example.com", "socket"),
+            ("", "https://api.example.com", "https://api.example.com", "request"),
+        ]
+        for request_text, socket_text, shown, hint in cases:
+            plan = plan_network_domains(request_text, socket_text)
+            self.assertFalse(plan["valid"], (request_text, socket_text))
+            self.assertIn(shown, plan["error"])
+            self.assertIn(hint, plan["error"].lower() if hint in ("path", "port") else plan["error"])
+            self.assertIn("微信公众平台 > 开发 > 开发管理 > 开发设置 > 服务器域名", plan["error"])
 
 
 if __name__ == "__main__":

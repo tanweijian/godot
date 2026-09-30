@@ -9,6 +9,10 @@
  *
  * Packaged code-package files stay read-only. user:// is the Godot /userfs
  * mount persisted under the WeChat user-data directory.
+ *
+ * HTTP and WebSocket use wx.request and wx.connectSocket. Godot's web
+ * libraries call fetch and WebSocket; bind() installs those on the host
+ * global so the engine does not need a browser network stack.
  */
 "use strict";
 
@@ -1000,6 +1004,7 @@ function createHost() {
 			if (wx) {
 				boundWx = wx;
 			}
+			installWeChatNetwork(root, boundWx);
 			if (root && typeof root.ontouchstart === "undefined") {
 				root.ontouchstart = null;
 			}
@@ -1794,6 +1799,613 @@ function createGodotFiles(wx) {
 	};
 }
 
+var NETWORK_CONSOLE_PATH = "微信公众平台 > 开发 > 开发管理 > 开发设置 > 服务器域名";
+
+function networkAllowlistReminder(requestDomains, socketDomains) {
+	var text = "Configure request and WebSocket domains in the WeChat developer console under " + NETWORK_CONSOLE_PATH + ". Put HTTPS origins in request合法域名 and WSS hosts in socket合法域名. Request entries must not include a path or the default port 443. Socket entries must not include a path or port. This exporter cannot configure or verify those allowlists. The generated project leaves urlCheck disabled, so Developer Tools skips the allowlist; real devices still enforce it.";
+	requestDomains = requestDomains || [];
+	socketDomains = socketDomains || [];
+	if (requestDomains.length || socketDomains.length) {
+		text += " Request domains: " + (requestDomains.length ? requestDomains.join(", ") : "(none)") + ".";
+		text += " Socket domains: " + (socketDomains.length ? socketDomains.join(", ") : "(none)") + ".";
+	} else {
+		text += " No request or WebSocket domains were entered. Add them to wechat/request_domains and wechat/socket_domains before release if the game uses HTTPRequest or WebSocketPeer.";
+	}
+	return text;
+}
+
+function utf8Encode(text) {
+	if (typeof TextEncoder === "function") {
+		return new TextEncoder().encode(text);
+	}
+	var bytes = [];
+	var i;
+	for (i = 0; i < text.length; i++) {
+		var code = text.charCodeAt(i);
+		if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+			var next = text.charCodeAt(i + 1);
+			if (next >= 0xdc00 && next <= 0xdfff) {
+				code = 0x10000 + ((code - 0xd800) << 10) + (next - 0xdc00);
+				i++;
+			}
+		}
+		if (code < 0x80) {
+			bytes.push(code);
+		} else if (code < 0x800) {
+			bytes.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+		} else if (code < 0x10000) {
+			bytes.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+		} else {
+			bytes.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+		}
+	}
+	return new Uint8Array(bytes);
+}
+
+function utf8Decode(bytes) {
+	if (typeof TextDecoder === "function") {
+		return new TextDecoder("utf-8").decode(bytes);
+	}
+	var out = "";
+	var i = 0;
+	while (i < bytes.length) {
+		var b = bytes[i];
+		if (b < 0x80) {
+			out += String.fromCharCode(b);
+			i++;
+		} else if (b < 0xe0) {
+			out += String.fromCharCode(((b & 0x1f) << 6) | (bytes[i + 1] & 0x3f));
+			i += 2;
+		} else if (b < 0xf0) {
+			out += String.fromCharCode(((b & 0x0f) << 12) | ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f));
+			i += 3;
+		} else {
+			var code = ((b & 0x07) << 18) | ((bytes[i + 1] & 0x3f) << 12) | ((bytes[i + 2] & 0x3f) << 6) | (bytes[i + 3] & 0x3f);
+			code -= 0x10000;
+			out += String.fromCharCode(0xd800 + (code >> 10), 0xdc00 + (code & 0x3ff));
+			i += 4;
+		}
+	}
+	return out;
+}
+
+function parseWeChatUrl(url) {
+	var match = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#]*)([^#]*)$/.exec(String(url));
+	if (!match || !match[2]) {
+		return null;
+	}
+	var authority = match[2];
+	var host = authority;
+	var port = "";
+	if (authority.charAt(0) === "[") {
+		var end = authority.indexOf("]");
+		if (end < 0) {
+			return null;
+		}
+		host = authority.slice(0, end + 1);
+		if (authority.charAt(end + 1) === ":") {
+			port = authority.slice(end + 2);
+		}
+	} else {
+		var colon = authority.lastIndexOf(":");
+		if (colon > 0 && authority.indexOf(":") === colon) {
+			host = authority.slice(0, colon);
+			port = authority.slice(colon + 1);
+		}
+	}
+	return { scheme: match[1].toLowerCase(), host: host, port: port, rest: match[3] || "" };
+}
+
+function requestUrlForWeChat(url) {
+	var parsed = parseWeChatUrl(url);
+	if (!parsed) {
+		return String(url);
+	}
+	var port = parsed.port;
+	if ((parsed.scheme === "https" && port === "443") || (parsed.scheme === "http" && port === "80")) {
+		port = "";
+	}
+	return parsed.scheme + "://" + parsed.host + (port ? ":" + port : "") + parsed.rest;
+}
+
+function allowlistEntry(kind, url) {
+	var parsed = parseWeChatUrl(url);
+	if (!parsed) {
+		return String(url);
+	}
+	if (kind === "socket") {
+		return "wss://" + parsed.host;
+	}
+	var port = parsed.port;
+	if (port === "443" || port === "80") {
+		port = "";
+	}
+	return "https://" + parsed.host + (port ? ":" + port : "");
+}
+
+function networkErrorDetail(error) {
+	var detail = errorDetail(error);
+	if (error && error.errno) {
+		detail += " errno " + error.errno;
+	}
+	return detail;
+}
+
+function isDomainFailure(detail) {
+	var lower = String(detail).toLowerCase();
+	return lower.indexOf("domain list") >= 0 || lower.indexOf("not in domain") >= 0 || lower.indexOf("合法域名") >= 0 || lower.indexOf("invalid url") >= 0 || lower.indexOf("600002") >= 0;
+}
+
+function networkFailureMessage(kind, url, error) {
+	var detail = networkErrorDetail(error);
+	var entry = allowlistEntry(kind, url);
+	var shown = kind === "socket" ? String(url) : requestUrlForWeChat(url);
+	var allowlist = kind === "socket" ? "socket合法域名" : "request合法域名";
+	var portHint = kind === "socket"
+		? "Socket allowlist entries are wss://host with no path or port."
+		: "Request allowlist entries are https://host or https://host:port with no path. Omit the default port 443; https://host:443 is not the same as https://host.";
+	var lower = detail.toLowerCase();
+	if (isDomainFailure(detail)) {
+		return "WeChat rejected " + kind + " " + shown + " (" + detail + "). Add " + entry + " to " + allowlist + " in " + NETWORK_CONSOLE_PATH + ". " + portHint + " The exporter cannot configure or verify that allowlist. Developer Tools skips this check while urlCheck is disabled; real devices still enforce it.";
+	}
+	if (lower.indexOf("ssl") >= 0 || lower.indexOf("certificate") >= 0 || lower.indexOf("tls") >= 0) {
+		return "WeChat rejected " + kind + " " + shown + " because the TLS certificate failed (" + detail + "). Use a certificate trusted by the device, with TLS 1.2 or newer, whose hostname matches " + entry + ".";
+	}
+	if (lower.indexOf("timeout") >= 0 || lower.indexOf("timed out") >= 0) {
+		return "WeChat " + kind + " " + shown + " timed out (" + detail + "). Check that the server accepts the connection. The timeout is game.json networkTimeout, 60000 ms unless the call sets its own.";
+	}
+	if (lower.indexOf("interrupted") >= 0) {
+		return "WeChat " + kind + " " + shown + " was interrupted because the mini game was backgrounded (" + detail + "). A request still running 5 seconds after hide fails, and new requests fail until the game is shown again.";
+	}
+	return "WeChat " + kind + " " + shown + " failed (" + detail + "). If the host rejected the domain, add " + entry + " to " + allowlist + " in " + NETWORK_CONSOLE_PATH + ". " + portHint + " The exporter cannot configure or verify that allowlist.";
+}
+
+function missingHostMessage(apiName) {
+	return "WeChat network calls require " + apiName + ". Open this project as a WeChat Mini Game with base library 2.19.0 or newer.";
+}
+
+function headerValue(header, name) {
+	if (!header) {
+		return "";
+	}
+	var wanted = name.toLowerCase();
+	var keys = Object.keys(header);
+	var i;
+	for (i = 0; i < keys.length; i++) {
+		if (String(keys[i]).toLowerCase() === wanted) {
+			var value = header[keys[i]];
+			if (Array.isArray(value)) {
+				return value.length ? String(value[0]) : "";
+			}
+			return value == null ? "" : String(value);
+		}
+	}
+	return "";
+}
+
+function headersForWeChat(headers) {
+	var out = {};
+	var contentType = "";
+	function add(name, value) {
+		if (!name) {
+			return;
+		}
+		var key = String(name);
+		if (key.toLowerCase() === "referer") {
+			return;
+		}
+		if (key.toLowerCase() === "content-type") {
+			contentType = String(value);
+			out["content-type"] = contentType;
+			return;
+		}
+		out[key] = String(value);
+	}
+	if (Array.isArray(headers)) {
+		var i;
+		for (i = 0; i < headers.length; i++) {
+			var item = headers[i];
+			if (Array.isArray(item)) {
+				add(item[0], item[1]);
+			}
+		}
+	} else if (headers && typeof headers.forEach === "function") {
+		headers.forEach(function (value, name) {
+			add(name, value);
+		});
+	} else if (headers && typeof headers === "object") {
+		var keys = Object.keys(headers);
+		var j;
+		for (j = 0; j < keys.length; j++) {
+			add(keys[j], headers[keys[j]]);
+		}
+	}
+	return { header: out, contentType: contentType };
+}
+
+function copyBody(body) {
+	if (body == null) {
+		return null;
+	}
+	if (typeof body === "string") {
+		return { text: body, bytes: utf8Encode(body) };
+	}
+	if (body instanceof ArrayBuffer) {
+		return { text: "", bytes: new Uint8Array(body.slice(0)) };
+	}
+	if (ArrayBuffer.isView(body)) {
+		return { text: "", bytes: new Uint8Array(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength)) };
+	}
+	return null;
+}
+
+function bytesToString(bytes) {
+	return utf8Decode(bytes);
+}
+
+function responseBytes(data) {
+	if (data == null) {
+		return new Uint8Array(0);
+	}
+	if (data instanceof Uint8Array) {
+		return data;
+	}
+	if (data instanceof ArrayBuffer) {
+		return new Uint8Array(data);
+	}
+	if (ArrayBuffer.isView(data)) {
+		return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+	}
+	if (typeof data === "string") {
+		return utf8Encode(data);
+	}
+	return new Uint8Array(0);
+}
+
+function wechatResponse(res, handle) {
+	var header = res && res.header ? res.header : {};
+	var cookies = res && Array.isArray(res.cookies) ? res.cookies : [];
+	var bytes = responseBytes(res ? res.data : null);
+	return {
+		status: res && typeof res.statusCode === "number" ? res.statusCode : 0,
+		headers: {
+			forEach: function (callback) {
+				var keys = Object.keys(header);
+				var count = 0;
+				var i;
+				for (i = 0; i < keys.length; i++) {
+					var name = String(keys[i]);
+					var lower = name.toLowerCase();
+					// wx.request already returns the decoded body, but keeps the
+					// compressed response headers. Godot would gunzip that body again.
+					if (lower === "content-encoding" || lower === "content-length" || lower === "transfer-encoding") {
+						continue;
+					}
+					var value = header[keys[i]];
+					if (Array.isArray(value)) {
+						value = value.join(", ");
+					}
+					callback(String(value), name);
+					count++;
+				}
+				for (i = 0; i < cookies.length; i++) {
+					callback(String(cookies[i]), "set-cookie");
+					count++;
+				}
+				if (!count) {
+					callback(String(bytes.length), "content-length");
+				}
+			},
+		},
+		body: {
+			getReader: function () {
+				var sent = false;
+				return {
+					read: function () {
+						if (sent || !bytes.length) {
+							sent = true;
+							return Promise.resolve({ done: true });
+						}
+						sent = true;
+						return Promise.resolve({ value: bytes, done: false });
+					},
+				};
+			},
+		},
+		abort: function () {
+			var task = handle && handle.task;
+			if (task && typeof task.abort === "function") {
+				task.abort();
+			}
+		},
+	};
+}
+
+function wechatFetch(wx, url, init) {
+	init = init || {};
+	var method = String(init.method || "GET").toUpperCase();
+	var prepared = headersForWeChat(init.headers);
+	var copied = copyBody(init.body);
+	var requestUrl = requestUrlForWeChat(url);
+	return new Promise(function (resolve, reject) {
+		function fail(error) {
+			var message = !wx || typeof wx.request !== "function" ? missingHostMessage("wx.request") : networkFailureMessage("request", url, error);
+			console.error("[Godot] " + message);
+			reject(new Error(message));
+		}
+		if (!wx || typeof wx.request !== "function") {
+			fail("wx.request is missing");
+			return;
+		}
+		var data;
+		if (copied) {
+			var type = prepared.contentType.toLowerCase();
+			if (type.indexOf("application/json") >= 0 || type.indexOf("application/x-www-form-urlencoded") >= 0) {
+				data = copied.text || bytesToString(copied.bytes);
+			} else {
+				data = copied.bytes.buffer.slice(copied.bytes.byteOffset, copied.bytes.byteOffset + copied.bytes.byteLength);
+				if (!prepared.contentType) {
+					prepared.header["content-type"] = "application/octet-stream";
+				}
+			}
+		}
+		var handle = { task: null };
+		var options = {
+			url: requestUrl,
+			method: method,
+			header: prepared.header,
+			dataType: "text",
+			responseType: "arraybuffer",
+			success: function (res) {
+				resolve(wechatResponse(res, handle));
+			},
+			fail: function (error) {
+				fail(error);
+			},
+		};
+		if (data !== undefined) {
+			options.data = data;
+		}
+		try {
+			handle.task = wx.request(options);
+		} catch (error) {
+			fail(error);
+		}
+	});
+}
+
+function selectedProtocol(header, requested) {
+	var value = headerValue(header, "sec-websocket-protocol");
+	if (value) {
+		return value.split(",")[0].trim();
+	}
+	if (requested && requested.length === 1) {
+		return requested[0];
+	}
+	return "";
+}
+
+function createWeChatWebSocket(wx) {
+	function WeChatWebSocket(url, protocols) {
+		var self = this;
+		self.url = String(url);
+		self.readyState = 0;
+		self.bufferedAmount = 0;
+		self.protocol = "";
+		self.binaryType = "arraybuffer";
+		self.onopen = null;
+		self.onmessage = null;
+		self.onerror = null;
+		self.onclose = null;
+		var closed = false;
+		var closing = false;
+		var task = null;
+
+		function emitFailure(error, code) {
+			if (closing || closed) {
+				return;
+			}
+			closing = true;
+			var message = !wx || typeof wx.connectSocket !== "function" ? missingHostMessage("wx.connectSocket") : networkFailureMessage("socket", self.url, error);
+			Promise.resolve().then(function () {
+				if (closed) {
+					return;
+				}
+				closed = true;
+				self.readyState = 3;
+				console.error("[Godot] " + message);
+				if (typeof self.onerror === "function") {
+					self.onerror({ type: "error" });
+				}
+				if (typeof self.onclose === "function") {
+					self.onclose({ code: code || 1006, reason: message, wasClean: false });
+				}
+			});
+		}
+
+		if (!wx || typeof wx.connectSocket !== "function") {
+			emitFailure("wx.connectSocket is missing", 1006);
+			return;
+		}
+		var protocolList = [];
+		if (Array.isArray(protocols)) {
+			var i;
+			for (i = 0; i < protocols.length; i++) {
+				if (protocols[i]) {
+					protocolList.push(String(protocols[i]));
+				}
+			}
+		} else if (typeof protocols === "string" && protocols) {
+			protocolList = protocols.split(",");
+		}
+		var options = {
+			url: self.url,
+			fail: function (error) {
+				emitFailure(error, 1006);
+			},
+		};
+		if (protocolList.length) {
+			options.protocols = protocolList;
+		}
+		try {
+			task = wx.connectSocket(options);
+		} catch (error) {
+			emitFailure(error, 1006);
+			return;
+		}
+		if (!task || typeof task.onOpen !== "function") {
+			emitFailure("wx.connectSocket did not return a SocketTask", 1006);
+			return;
+		}
+		task.onOpen(function (res) {
+			if (closed) {
+				return;
+			}
+			self.readyState = 1;
+			self.protocol = selectedProtocol(res && res.header, protocolList);
+			if (typeof self.onopen === "function") {
+				self.onopen({ type: "open" });
+			}
+		});
+		task.onMessage(function (res) {
+			if (closed || typeof self.onmessage !== "function") {
+				return;
+			}
+			self.onmessage({ data: res ? res.data : "" });
+		});
+		task.onError(function (error) {
+			emitFailure(error, 1006);
+		});
+		task.onClose(function (res) {
+			if (closed) {
+				return;
+			}
+			closed = true;
+			self.readyState = 3;
+			if (typeof self.onclose === "function") {
+				self.onclose({
+					code: res && typeof res.code === "number" ? res.code : 1000,
+					reason: res && res.reason ? String(res.reason) : "",
+					wasClean: true,
+				});
+			}
+		});
+		self.send = function (data) {
+			if (self.readyState !== 1) {
+				throw new Error("WebSocket is not open");
+			}
+			var payload = data;
+			var size = 0;
+			if (typeof data === "string") {
+				payload = data;
+				size = utf8Encode(data).length;
+			} else if (data instanceof ArrayBuffer) {
+				payload = data;
+				size = data.byteLength;
+			} else if (ArrayBuffer.isView(data)) {
+				payload = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+				size = payload.byteLength;
+			}
+			self.bufferedAmount += size;
+			task.send({
+				data: payload,
+				success: function () {
+					self.bufferedAmount = Math.max(0, self.bufferedAmount - size);
+				},
+				fail: function (error) {
+					self.bufferedAmount = Math.max(0, self.bufferedAmount - size);
+					emitFailure(error, 1006);
+				},
+			});
+		};
+		self.close = function (code, reason) {
+			if (self.readyState >= 2) {
+				return;
+			}
+			self.readyState = 2;
+			if (!task || typeof task.close !== "function") {
+				emitFailure("SocketTask.close is missing", code || 1006);
+				return;
+			}
+			task.close({
+				code: code || 1000,
+				reason: reason || "",
+				fail: function (error) {
+					emitFailure(error, code || 1006);
+				},
+			});
+		};
+	}
+	WeChatWebSocket.prototype.CONNECTING = 0;
+	WeChatWebSocket.prototype.OPEN = 1;
+	WeChatWebSocket.prototype.CLOSING = 2;
+	WeChatWebSocket.prototype.CLOSED = 3;
+	WeChatWebSocket.CONNECTING = 0;
+	WeChatWebSocket.OPEN = 1;
+	WeChatWebSocket.CLOSING = 2;
+	WeChatWebSocket.CLOSED = 3;
+	return WeChatWebSocket;
+}
+
+function installTextCodec(root) {
+	if (typeof TextEncoder === "function" && typeof TextDecoder === "function") {
+		return;
+	}
+	function Encoder() {}
+	Encoder.prototype.encode = function (text) {
+		return utf8Encode(String(text));
+	};
+	function Decoder() {}
+	Decoder.prototype.decode = function (bytes) {
+		return utf8Decode(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []));
+	};
+	var targets = [root];
+	if (typeof globalThis !== "undefined") {
+		targets.push(globalThis);
+	}
+	var i;
+	for (i = 0; i < targets.length; i++) {
+		if (!targets[i]) {
+			continue;
+		}
+		if (typeof targets[i].TextEncoder !== "function") {
+			targets[i].TextEncoder = Encoder;
+		}
+		if (typeof targets[i].TextDecoder !== "function") {
+			targets[i].TextDecoder = Decoder;
+		}
+	}
+}
+
+function installWeChatNetwork(root, wx) {
+	if (!root) {
+		return;
+	}
+	installTextCodec(root);
+	var fetchImpl = function (url, init) {
+		return wechatFetch(wx, url, init);
+	};
+	var socketImpl = createWeChatWebSocket(wx);
+	var targets = [root];
+	if (typeof GameGlobal !== "undefined") {
+		targets.push(GameGlobal);
+		if (typeof globalThis !== "undefined") {
+			targets.push(globalThis);
+		}
+		if (typeof window !== "undefined") {
+			targets.push(window);
+		}
+	}
+	var i;
+	for (i = 0; i < targets.length; i++) {
+		if (!targets[i]) {
+			continue;
+		}
+		targets[i].fetch = fetchImpl;
+		targets[i].WebSocket = socketImpl;
+	}
+}
+
 var api = {
 	bufferSize: bufferSize,
 	changedTouchEvent: changedTouchEvent,
@@ -1806,6 +2418,7 @@ var api = {
 	cssRect: cssRect,
 	diagnoseRendererMessage: diagnoseRendererMessage,
 	metricsFromInfo: metricsFromInfo,
+	networkAllowlistReminder: networkAllowlistReminder,
 	probeCompatibility3D: probeCompatibility3D,
 	readPerformanceSample: readPerformanceSample,
 	readWindowInfo: readWindowInfo,

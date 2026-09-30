@@ -8,6 +8,7 @@
 		A project that does not resolve to the Compatibility renderer is rejected before export. At startup the project checks that WebGL 2 can compile a Compatibility shader and provide a depth buffer. Missing stencil, float color buffers, instancing, or MSAA are reported and skipped instead of crashing. Shader compilation failures are shown with the driver log. Frame rate and memory are logged as device baselines and are not a guaranteed minimum.
 		An empty AppID is written as the WeChat local-preview AppID so the project can be opened before a production AppID exists.
 		Developers assign project resources to package groups explicitly. Each group is exported as a WeChat subpackage and a Godot resource pack. The game calls [method WeChat.load_resource_subpackage] and can use [code]res://[/code] files from that pack only after the subpackage loads successfully. Export rejects a main package above 4 MB and a project above the selected total budget, 20 MB by default or 30 MB for an eligible project.
+		Godot HTTPRequest and WebSocketPeer calls use wx.request and wx.connectSocket. Enter the domains those calls need in the export preset. Export writes them to godot.wechat.json and reminds you to add them to the WeChat console allowlists. The exporter cannot configure or verify those allowlists.
 	</description>
 	<tutorials>
 	</tutorials>
@@ -26,6 +27,12 @@
 		</member>
 		<member name="wechat/resource_groups" type="String" setter="" getter="">
 			Explicit resource package groups, one per line: [code]group_name:res://pattern[,res://pattern][/code]. Patterns use Godot's case-insensitive wildcards. Unmatched resources stay in the main package. Lines starting with [code]#[/code] are comments. Group names use letters, digits, [code]_[/code], or [code]-[/code], and cannot be [code]godot-runtime[/code].
+		</member>
+		<member name="wechat/request_domains" type="String" setter="" getter="">
+			HTTPS origins the game requests, one per line or comma-separated. Each entry is [code]https://host[/code] or [code]https://host:port[/code] with no path. Omit the default port 443. Export reminds you to add the same entries to request合法域名 in the WeChat developer console. It cannot configure or verify that allowlist.
+		</member>
+		<member name="wechat/socket_domains" type="String" setter="" getter="">
+			WSS hosts the game connects to, one per line or comma-separated. Each entry is [code]wss://host[/code] with no path or port. Export reminds you to add the same entries to socket合法域名 in the WeChat developer console. It cannot configure or verify that allowlist.
 		</member>
 	</members>
 </class>
