@@ -1,8 +1,11 @@
 /**
- * WeChat window, touch, lifecycle, and file mapping.
+ * WeChat window, touch, lifecycle, audio, and file mapping.
  *
  * Touch conversion matches Godot's web input path: CSS pixels in, canvas
  * buffer pixels out. Safe area uses that same buffer pixel space.
+ *
+ * Godot AudioServer keeps mixing. Its output is one WeChat WebAudioContext,
+ * unlocked by a user gesture and suspended while the mini game is hidden.
  *
  * Packaged code-package files stay read-only. user:// is the Godot /userfs
  * mount persisted under the WeChat user-data directory.
@@ -400,7 +403,419 @@ function readPerformanceSample(wx, performanceObject, startedMs, frameCount, now
 	});
 }
 
+function compareVersion(left, right) {
+	var leftParts = String(left || "").split(".");
+	var rightParts = String(right || "").split(".");
+	var count = Math.max(leftParts.length, rightParts.length);
+	var i;
+	for (i = 0; i < count; i++) {
+		var leftNumber = parseInt(leftParts[i] || "0", 10);
+		var rightNumber = parseInt(rightParts[i] || "0", 10);
+		if (isNaN(leftNumber)) {
+			leftNumber = 0;
+		}
+		if (isNaN(rightNumber)) {
+			rightNumber = 0;
+		}
+		if (leftNumber > rightNumber) {
+			return 1;
+		}
+		if (leftNumber < rightNumber) {
+			return -1;
+		}
+	}
+	return 0;
+}
+
+function iosVersionFromSystem(system) {
+	var parts = String(system || "").split(/\s+/);
+	var i;
+	for (i = parts.length - 1; i >= 0; i--) {
+		if (/^\d+(?:\.\d+)*$/.test(parts[i])) {
+			return parts[i];
+		}
+	}
+	return "";
+}
+
+function readAudioEnvironment(wx, root, override) {
+	override = override || {};
+	var sdkVersion = override.sdkVersion;
+	var system = override.system;
+	var highPerformance = override.iosHighPerformanceMode;
+	if (wx && sdkVersion == null) {
+		try {
+			if (typeof wx.getAppBaseInfo === "function") {
+				var appBase = wx.getAppBaseInfo() || {};
+				if (appBase.SDKVersion) {
+					sdkVersion = appBase.SDKVersion;
+				}
+			}
+		} catch (error) {
+			console.error("[Godot] wx.getAppBaseInfo failed while reading the audio runtime: " + error);
+		}
+		if (!sdkVersion && typeof wx.getSystemInfoSync === "function") {
+			try {
+				var info = wx.getSystemInfoSync() || {};
+				sdkVersion = info.SDKVersion || "";
+				if (system == null && info.system) {
+					system = info.system;
+				}
+			} catch (error) {
+				console.error("[Godot] wx.getSystemInfoSync failed while reading the audio runtime: " + error);
+			}
+		}
+	}
+	if (wx && system == null && typeof wx.getDeviceInfo === "function") {
+		try {
+			var device = wx.getDeviceInfo() || {};
+			system = device.system || "";
+		} catch (error) {
+			console.error("[Godot] wx.getDeviceInfo failed while reading the audio runtime: " + error);
+		}
+	}
+	if (highPerformance == null && root && typeof root.isIOSHighPerformanceMode !== "undefined") {
+		highPerformance = !!root.isIOSHighPerformanceMode;
+	}
+	system = system || "";
+	return {
+		sdkVersion: sdkVersion || "",
+		system: system,
+		systemVersion: iosVersionFromSystem(system),
+		iosHighPerformanceMode: !!highPerformance,
+	};
+}
+
+function needsIosContextReset(env) {
+	return !!(env && env.iosHighPerformanceMode && compareVersion(env.systemVersion, "17.5") >= 0);
+}
+
+function needsIosStartupResume(env) {
+	return !!(env && env.iosHighPerformanceMode && compareVersion(env.sdkVersion, "2.25.3") >= 0);
+}
+
+function createAudioSession(wx, options) {
+	options = options || {};
+	var schedule = typeof options.schedule === "function" ? options.schedule : function (fn, delay) {
+		return setTimeout(fn, delay);
+	};
+	var cancelSchedule = typeof options.cancelSchedule === "function" ? options.cancelSchedule : function (id) {
+		clearTimeout(id);
+	};
+	var resumeDelayMs = typeof options.iosResumeDelayMs === "number" ? options.iosResumeDelayMs : 2000;
+	var environmentOverride = options.environment || null;
+	var boundWx = wx || null;
+	var root = options.root || null;
+	var env = environmentOverride ? readAudioEnvironment(boundWx, root, environmentOverride) : {
+		sdkVersion: "",
+		system: "",
+		systemVersion: "",
+		iosHighPerformanceMode: false,
+	};
+	var context = null;
+	var generation = 0;
+	var unlocked = false;
+	var backgrounded = false;
+	var interrupted = false;
+	var notedRate = false;
+	var resumeTimer = null;
+	var replacedHandler = null;
+	var initFailure = null;
+	var diagnostics = [];
+
+	function report(level, title, message) {
+		var text = "[Godot] " + title + ": " + message;
+		if (level === "warn") {
+			console.warn(text);
+		} else {
+			console.error(text);
+		}
+		var i;
+		for (i = 0; i < diagnostics.length; i++) {
+			if (diagnostics[i].title === title && diagnostics[i].message === message) {
+				return diagnostics[i];
+			}
+		}
+		var entry = { level: level, title: title, message: message };
+		diagnostics.push(entry);
+		return entry;
+	}
+
+	function fail(level, title, message) {
+		report(level, title, message);
+		return { ok: false, title: title, message: message };
+	}
+
+	function clearResumeTimer() {
+		if (resumeTimer !== null) {
+			cancelSchedule(resumeTimer);
+			resumeTimer = null;
+		}
+	}
+
+	function failResume(reason, error) {
+		return fail(
+			"error",
+			"Audio resume failed",
+			"WebAudioContext.resume() failed during " + reason + ": " + error + ". Tap the game so WeChat accepts the user gesture unlock. If audio stays silent after a phone call, wait for the interruption to end. On iOS 17.5 or newer in high-performance mode the context is recreated when the game returns from the background; reopen the mini game if it is still silent."
+		);
+	}
+
+	function resume(reason) {
+		if (!context || typeof context.resume !== "function") {
+			return fail(
+				"error",
+				"Audio resume failed",
+				"WebAudioContext.resume() is missing during " + reason + ". Godot cannot unlock audio. Update the WeChat base library to 2.19.0 or newer."
+			);
+		}
+		var result;
+		try {
+			result = context.resume();
+		} catch (error) {
+			return failResume(reason, error);
+		}
+		if (result && typeof result.then === "function") {
+			result.then(function () {}, function (error) {
+				failResume(reason, error);
+			});
+		}
+		return { ok: true };
+	}
+
+	function suspend(reason) {
+		if (!context || typeof context.suspend !== "function") {
+			return { ok: true, skipped: true };
+		}
+		var result;
+		try {
+			result = context.suspend();
+		} catch (error) {
+			return fail(
+				"error",
+				"Audio suspend failed",
+				"WebAudioContext.suspend() failed during " + reason + ": " + error + ". Playback may keep going while the mini game is in the background or interrupted. Update the WeChat client if audio does not pause."
+			);
+		}
+		if (result && typeof result.then === "function") {
+			result.then(function () {}, function (error) {
+				fail(
+					"error",
+					"Audio suspend failed",
+					"WebAudioContext.suspend() failed during " + reason + ": " + error + ". Playback may keep going while the mini game is in the background or interrupted. Update the WeChat client if audio does not pause."
+				);
+			});
+		}
+		return { ok: true };
+	}
+
+	function createContext() {
+		clearResumeTimer();
+		if (!boundWx || typeof boundWx.createWebAudioContext !== "function") {
+			initFailure = fail(
+				"error",
+				"WebAudioContext unavailable",
+				"wx.createWebAudioContext is missing. Godot AudioServer mixes in the engine and writes one WebAudioContext; it does not call wx.createInnerAudioContext for each player. Set the base library to 2.19.0 or newer. In Developer Tools use Details > Local Settings > Base library."
+			);
+			return initFailure;
+		}
+		var created;
+		try {
+			created = boundWx.createWebAudioContext();
+		} catch (error) {
+			initFailure = fail(
+				"error",
+				"WebAudioContext initialization failed",
+				"wx.createWebAudioContext() threw " + error + ". Godot audio stays silent until a WebAudioContext exists. Update WeChat Developer Tools and the WeChat client, and set the base library to 2.19.0 or newer."
+			);
+			return initFailure;
+		}
+		if (!created || !created.destination || typeof created.createScriptProcessor !== "function") {
+			initFailure = fail(
+				"error",
+				"WebAudioContext initialization failed",
+				"wx.createWebAudioContext() did not return a context with destination and createScriptProcessor. Godot's mix is written with createScriptProcessor into that context, not with wx.createInnerAudioContext. Update the WeChat base library to 2.19.0 or newer."
+			);
+			return initFailure;
+		}
+		if (typeof created.state !== "string") {
+			created.state = "suspended";
+		}
+		if (typeof created.destination.channelCount !== "number") {
+			created.destination.channelCount = 2;
+		}
+		// Developer Tools reports audioWorklet without a usable AudioWorkletNode.
+		// Godot would then select that driver and connect the no-op stub. The
+		// documented mix output is createScriptProcessor.
+		if (created.audioWorklet && typeof AudioWorkletNode !== "function") {
+			try {
+				Object.defineProperty(created, "audioWorklet", { value: undefined, configurable: true });
+			} catch (error) {
+				report(
+					"warn",
+					"AudioWorklet unavailable",
+					"This WebAudioContext exposes audioWorklet, but AudioWorkletNode is missing. Godot may select a silent worklet driver instead of createScriptProcessor. " + error
+				);
+			}
+		}
+		context = created;
+		generation += 1;
+		initFailure = null;
+		if (needsIosStartupResume(env)) {
+			resumeTimer = schedule(function () {
+				resumeTimer = null;
+				if (backgrounded || interrupted) {
+					return;
+				}
+				resume("ios high-performance startup");
+			}, resumeDelayMs);
+		}
+		return { ok: true, output: "WebAudioContext", context: context, generation: generation };
+	}
+
+	function resetContext() {
+		var previous = context;
+		context = null;
+		if (previous && typeof previous.close === "function") {
+			try {
+				previous.close();
+			} catch (error) {
+				fail(
+					"error",
+					"Audio context reset failed",
+					"WebAudioContext.close() failed before recreating it for iOS 17.5 high-performance mode: " + error + ". Godot will still try to create a new WebAudioContext."
+				);
+			}
+		}
+		return createContext();
+	}
+
+	function install(target) {
+		if (!context || !target) {
+			return;
+		}
+		function WeChatAudioContext(constructorOptions) {
+			if (!notedRate && constructorOptions && typeof constructorOptions.sampleRate === "number" && context && typeof context.sampleRate === "number" && constructorOptions.sampleRate !== context.sampleRate) {
+				notedRate = true;
+				report(
+					"warn",
+					"WebAudioContext sample rate",
+					"Godot asked for " + constructorOptions.sampleRate + " Hz, but wx.createWebAudioContext() does not accept a sample rate. Godot will mix at the context rate of " + context.sampleRate + " Hz."
+				);
+			}
+			return context;
+		}
+		target.AudioContext = WeChatAudioContext;
+		target.webkitAudioContext = WeChatAudioContext;
+	}
+
+	return {
+		attach: function (nextWx, nextRoot) {
+			boundWx = nextWx || boundWx;
+			root = nextRoot || root;
+			env = readAudioEnvironment(boundWx, root, environmentOverride);
+			var created = context ? { ok: true, output: "WebAudioContext", context: context, generation: generation } : createContext();
+			if (created.ok) {
+				install(root);
+			}
+			return created;
+		},
+		unlock: function () {
+			unlocked = true;
+			if (!context || backgrounded || interrupted) {
+				return { ok: true, pending: !context };
+			}
+			if (context.state === "running") {
+				return { ok: true };
+			}
+			return resume("user gesture");
+		},
+		onBackground: function () {
+			if (backgrounded) {
+				return { ok: true, skipped: true };
+			}
+			backgrounded = true;
+			clearResumeTimer();
+			return suspend("background");
+		},
+		onForeground: function () {
+			var wasBackground = backgrounded;
+			backgrounded = false;
+			if (!wasBackground || !context) {
+				return { ok: true, skipped: true };
+			}
+			if (needsIosContextReset(env)) {
+				var created = resetContext();
+				if (!created.ok) {
+					return created;
+				}
+				if (replacedHandler) {
+					try {
+						replacedHandler(context);
+					} catch (error) {
+						report(
+							"error",
+							"Audio output reconnect failed",
+							"Godot could not move its mix onto the recreated WeChat WebAudioContext: " + error + ". Stream and sample playback may stay silent until the mini game is reopened. This reset is required on iOS 17.5 or newer in high-performance mode."
+						);
+					}
+				}
+			}
+			if (!unlocked) {
+				report(
+					"warn",
+					"Audio locked",
+					"WeChat WebAudioContext stays suspended until the first tap. Tap the game to unlock Godot audio. Output is the shared WebAudioContext, not a WeChat player for each sound."
+				);
+				return { ok: true, waitingForGesture: true };
+			}
+			if (interrupted) {
+				return { ok: true, skipped: true };
+			}
+			return resume("foreground");
+		},
+		onInterruptionBegin: function () {
+			interrupted = true;
+			return suspend("audio interruption");
+		},
+		onInterruptionEnd: function () {
+			interrupted = false;
+			if (backgrounded || !context) {
+				return { ok: true, skipped: true };
+			}
+			if (!unlocked) {
+				report(
+					"warn",
+					"Audio locked",
+					"WeChat WebAudioContext stays suspended until the first tap. Tap the game to unlock Godot audio. Output is the shared WebAudioContext, not a WeChat player for each sound."
+				);
+				return { ok: true, waitingForGesture: true };
+			}
+			return resume("audio interruption end");
+		},
+		setContextReplacedHandler: function (handler) {
+			replacedHandler = handler;
+		},
+		failure: function () {
+			return initFailure;
+		},
+		diagnostics: function () {
+			return diagnostics.slice();
+		},
+		isUnlocked: function () {
+			return unlocked;
+		},
+		context: function () {
+			return context;
+		},
+		generation: function () {
+			return generation;
+		},
+	};
+}
+
 function createHost() {
+	var audio = createAudioSession(null, {});
 	var runtimeToken = { kind: "godot-wechat-runtime" };
 	var metrics = metricsFromInfo({});
 	var foreground = true;
@@ -516,6 +931,7 @@ function createHost() {
 			}
 		},
 		hide: function () {
+			audio.onBackground();
 			if (!foreground) {
 				return;
 			}
@@ -545,9 +961,16 @@ function createHost() {
 				return;
 			}
 			foreground = true;
+			audio.onForeground();
 			if (lifecycle) {
 				lifecycle(true);
 			}
+		},
+		audioSession: function () {
+			return audio;
+		},
+		setAudioContextReplacedHandler: function (handler) {
+			audio.setContextReplacedHandler(handler);
 		},
 		bind: function (target, wx) {
 			root = target || root;
@@ -566,12 +989,14 @@ function createHost() {
 				wx[name](handler);
 			}
 			listen("onTouchStart", function (event) {
+				audio.unlock();
 				dispatch(canvasFor(root), "touchstart", changedTouchEvent(event));
 			});
 			listen("onTouchMove", function (event) {
 				dispatch(canvasFor(root), "touchmove", changedTouchEvent(event));
 			});
 			listen("onTouchEnd", function (event) {
+				audio.unlock();
 				dispatch(canvasFor(root), "touchend", changedTouchEvent(event));
 			});
 			listen("onTouchCancel", function (event) {
@@ -586,6 +1011,20 @@ function createHost() {
 			listen("onWindowResize", function () {
 				host.refresh(readWindowInfo(wx));
 			});
+			function listenAudio(name, handler) {
+				if (typeof wx[name] !== "function") {
+					console.error("[Godot] " + name + " is missing. Audio interruptions need this WeChat host API so Godot can pause for calls and resume afterward. Update the base library.");
+					return;
+				}
+				wx[name](handler);
+			}
+			listenAudio("onAudioInterruptionBegin", function () {
+				audio.onInterruptionBegin();
+			});
+			listenAudio("onAudioInterruptionEnd", function () {
+				audio.onInterruptionEnd();
+			});
+			audio.attach(wx, root);
 		},
 	};
 	return host;
@@ -1239,6 +1678,7 @@ function createGodotFiles(wx) {
 var api = {
 	bufferSize: bufferSize,
 	changedTouchEvent: changedTouchEvent,
+	createAudioSession: createAudioSession,
 	createGodotFiles: createGodotFiles,
 	createHost: createHost,
 	createPackageAccess: createPackageAccess,

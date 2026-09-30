@@ -190,27 +190,39 @@ class SampleNodeBus {
 	 * @param {Bus} bus The bus related to the new `SampleNodeBus`.
 	 */
 	constructor(bus) {
-		const NUMBER_OF_WEB_CHANNELS = 6;
-
 		/** @type {Bus} */
 		this._bus = bus;
+		this._rebuild({
+			l: 1,
+			r: 1,
+			sl: 1,
+			sr: 1,
+			c: 1,
+			lfe: 1,
+		});
+	}
 
-		/** @type {ChannelSplitterNode} */
+	/**
+	 * Builds the channel graph on the current context.
+	 * @param {{l: number, r: number, sl: number, sr: number, c: number, lfe: number}} gains
+	 * @returns {void}
+	 */
+	_rebuild(gains) {
+		const NUMBER_OF_WEB_CHANNELS = 6;
 		this._channelSplitter = GodotAudio.ctx.createChannelSplitter(NUMBER_OF_WEB_CHANNELS);
-		/** @type {GainNode} */
 		this._l = GodotAudio.ctx.createGain();
-		/** @type {GainNode} */
 		this._r = GodotAudio.ctx.createGain();
-		/** @type {GainNode} */
 		this._sl = GodotAudio.ctx.createGain();
-		/** @type {GainNode} */
 		this._sr = GodotAudio.ctx.createGain();
-		/** @type {GainNode} */
 		this._c = GodotAudio.ctx.createGain();
-		/** @type {GainNode} */
 		this._lfe = GodotAudio.ctx.createGain();
-		/** @type {ChannelMergerNode} */
 		this._channelMerger = GodotAudio.ctx.createChannelMerger(NUMBER_OF_WEB_CHANNELS);
+		this._l.gain.value = gains.l;
+		this._r.gain.value = gains.r;
+		this._sl.gain.value = gains.sl;
+		this._sr.gain.value = gains.sr;
+		this._c.gain.value = gains.c;
+		this._lfe.gain.value = gains.lfe;
 
 		this._channelSplitter
 			.connect(this._l, GodotAudio.WebChannel.CHANNEL_L)
@@ -256,6 +268,27 @@ class SampleNodeBus {
 			);
 
 		this._channelMerger.connect(this._bus.getInputNode());
+	}
+
+	/**
+	 * Rebuilds this graph after the WebAudio context is replaced.
+	 * @returns {void}
+	 */
+	retarget() {
+		const gains = {
+			l: this._l.gain.value,
+			r: this._r.gain.value,
+			sl: this._sl.gain.value,
+			sr: this._sr.gain.value,
+			c: this._c.gain.value,
+			lfe: this._lfe.gain.value,
+		};
+		try {
+			this._channelMerger.disconnect();
+		} catch (error) {
+			// The previous context may already be closed.
+		}
+		this._rebuild(gains);
 	}
 
 	/**
@@ -617,6 +650,13 @@ class SampleNode {
 	 * If the worklet module is not loaded in, it will be added
 	 */
 	async connectPositionWorklet(start) {
+		// Position reporting needs AudioWorklet. Playback itself does not.
+		if (!GodotAudio.ctx || !GodotAudio.ctx.audioWorklet) {
+			if (start) {
+				this.start();
+			}
+			return;
+		}
 		await GodotAudio.audioPositionWorkletPromise;
 		if (this.isCanceled) {
 			return;
@@ -738,6 +778,40 @@ class SampleNode {
 		}
 		this._source.start(this.startTime, this.offset + pauseTime);
 		this.isStarted = true;
+	}
+
+	/**
+	 * Moves this sample onto the current audio context.
+	 * @returns {void}
+	 */
+	retargetContext() {
+		if (this.isCanceled) {
+			return;
+		}
+		if (this._positionWorklet) {
+			try {
+				this._positionWorklet.disconnect();
+			} catch (error) {
+				// The previous context may already be closed.
+			}
+			this._positionWorklet = null;
+		}
+		for (const sampleNodeBus of this._sampleNodeBuses.values()) {
+			sampleNodeBus.retarget();
+		}
+		const wasStarted = this.isStarted && !this.isPaused;
+		if (this._source) {
+			try {
+				this._source.disconnect();
+			} catch (error) {
+				// The previous context may already be closed.
+			}
+			this._source = null;
+		}
+		this.isStarted = false;
+		if (wasStarted) {
+			this._restart();
+		}
 	}
 
 	/**
@@ -1071,6 +1145,49 @@ class Bus {
 	}
 
 	/**
+	 * Recreates this bus on the current audio context, keeping its gains.
+	 * @returns {void}
+	 */
+	retargetNodes() {
+		this._retainedSend = this._send;
+		this._retainedVolume = this._gainNode.gain.value;
+		this._retainedSolo = this._soloNode.gain.value;
+		this._retainedMute = this._muteNode.gain.value;
+		try {
+			this.getOutputNode().disconnect();
+		} catch (error) {
+			// No connection yet, or the old context is closed.
+		}
+		this._gainNode = GodotAudio.ctx.createGain();
+		this._soloNode = GodotAudio.ctx.createGain();
+		this._muteNode = GodotAudio.ctx.createGain();
+		this._gainNode.gain.value = this._retainedVolume;
+		this._soloNode.gain.value = this._retainedSolo;
+		this._muteNode.gain.value = this._retainedMute;
+		this._gainNode.connect(this._soloNode).connect(this._muteNode);
+	}
+
+	/**
+	 * Reconnects the send saved by `retargetNodes`.
+	 * @returns {void}
+	 */
+	retargetSend() {
+		const send = this._retainedSend;
+		this._send = send;
+		try {
+			if (send == null) {
+				if (this.getId() === 0) {
+					this.getOutputNode().connect(GodotAudio.ctx.destination);
+				}
+				return;
+			}
+			this.getOutputNode().connect(send.getInputNode());
+		} catch (error) {
+			GodotRuntime.error('Could not reconnect a Godot audio bus after WebAudioContext recreation', error);
+		}
+	}
+
+	/**
 	 * Clears the current bus.
 	 * @returns {void}
 	 */
@@ -1282,10 +1399,82 @@ const _GodotAudio = {
 			}, 1000);
 			GodotOS.atexit(GodotAudio.close_async);
 
-			const path = GodotConfig.locate_file('godot.audio.position.worklet.js');
-			GodotAudio.audioPositionWorkletPromise = ctx.audioWorklet.addModule(path);
+			if (ctx.audioWorklet) {
+				const path = GodotConfig.locate_file('godot.audio.position.worklet.js');
+				GodotAudio.audioPositionWorkletPromise = ctx.audioWorklet.addModule(path);
+			} else {
+				// WeChat WebAudioContext has ScriptProcessorNode and no AudioWorklet.
+				GodotAudio.audioPositionWorkletPromise = Promise.resolve();
+			}
 
 			return ctx.destination.channelCount;
+		},
+
+		/**
+		 * Points the mix and live samples at a replacement audio context.
+		 * @param {AudioContext} next
+		 * @returns {void}
+		 */
+		retargetContext: function (next) {
+			if (!next || next === GodotAudio.ctx) {
+				return;
+			}
+			const previous = GodotAudio.ctx;
+			const stateHandler = previous ? previous.onstatechange : null;
+			GodotAudio.ctx = next;
+			if (stateHandler) {
+				next.onstatechange = stateHandler;
+				try {
+					next.onstatechange();
+				} catch (error) {
+					GodotRuntime.error(error);
+				}
+			}
+			if (GodotAudio.driver === GodotAudioScript && GodotAudioScript.script) {
+				const oldScript = GodotAudioScript.script;
+				const handler = oldScript.onaudioprocess;
+				const bufferSize = oldScript.bufferSize || 1024;
+				const channels = GodotAudioScript.outputChannels || oldScript.channelCount || 2;
+				try {
+					oldScript.disconnect();
+				} catch (error) {
+					// The closed context may already have dropped the node.
+				}
+				oldScript.onaudioprocess = null;
+				try {
+					const script = next.createScriptProcessor(bufferSize, 2, channels);
+					script.onaudioprocess = handler;
+					script.connect(next.destination);
+					GodotAudioScript.script = script;
+				} catch (error) {
+					GodotRuntime.error('Could not reconnect Godot audio output to the recreated WebAudioContext. Stream playback stays silent until the mini game is reopened.', error);
+				}
+			} else if (GodotAudio.driver && GodotAudio.driver !== GodotAudioScript) {
+				GodotRuntime.error('AudioWorklet output cannot move to a recreated WebAudioContext. Use the ScriptProcessor driver, which WeChat WebAudioContext provides.');
+			}
+			const buses = GodotAudio.buses || [];
+			for (let i = 0; i < buses.length; i++) {
+				if (typeof buses[i].retargetNodes === 'function') {
+					buses[i].retargetNodes();
+				}
+				}
+			for (let i = 0; i < buses.length; i++) {
+				if (typeof buses[i].retargetSend === 'function') {
+					buses[i].retargetSend();
+				}
+				}
+			if (GodotAudio.sampleNodes) {
+				GodotAudio.sampleNodes.forEach((node) => {
+					if (typeof node.retargetContext !== 'function') {
+						return;
+					}
+					try {
+						node.retargetContext();
+					} catch (error) {
+						GodotRuntime.error('Could not move a Godot sample onto the recreated WebAudioContext. Play it again.', error);
+					}
+				});
+			}
 		},
 
 		create_input: function (callback) {
@@ -1582,7 +1771,12 @@ const _GodotAudio = {
 	godot_audio_resume__sig: 'v',
 	godot_audio_resume: function () {
 		if (GodotAudio.ctx && GodotAudio.ctx.state !== 'running') {
-			GodotAudio.ctx.resume();
+			const resumed = GodotAudio.ctx.resume();
+			if (resumed && typeof resumed.catch === 'function') {
+				resumed.catch(function (error) {
+					GodotRuntime.error('Audio resume failed. A user gesture is required before playback can start.', error);
+				});
+			}
 		}
 	},
 
@@ -2193,6 +2387,7 @@ const GodotAudioScript = {
 				2,
 				channel_count
 			);
+			GodotAudioScript.outputChannels = channel_count;
 			GodotAudio.driver = GodotAudioScript;
 			return GodotAudioScript.script.bufferSize;
 		},

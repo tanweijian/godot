@@ -49,7 +49,7 @@ const GodotWeChat = {
 		GodotRuntime.setHeapValue(p_rect + 12, area.height | 0, 'i32');
 	},
 
-	godot_js_wechat_lifecycle_cb__deps: ['$GodotWeChat', '$GodotRuntime'],
+	godot_js_wechat_lifecycle_cb__deps: ['$GodotWeChat', '$GodotRuntime', '$GodotAudio'],
 	godot_js_wechat_lifecycle_cb__proxy: 'sync',
 	godot_js_wechat_lifecycle_cb__sig: 'vi',
 	godot_js_wechat_lifecycle_cb: function (p_callback) {
@@ -61,6 +61,13 @@ const GodotWeChat = {
 		host.setLifecycleHandler(function (foreground) {
 			func(foreground ? 1 : 0);
 		});
+		if (typeof host.setAudioContextReplacedHandler === 'function') {
+			host.setAudioContextReplacedHandler(function (context) {
+				if (typeof GodotAudio.retargetContext === 'function') {
+					GodotAudio.retargetContext(context);
+				}
+			});
+		}
 	},
 };
 
