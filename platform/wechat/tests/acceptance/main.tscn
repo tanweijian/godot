@@ -1,0 +1,52 @@
+[gd_scene load_steps=5 format=3 uid="uid://wechatacceptance"]
+
+[ext_resource type="Script" path="res://main.gd" id="1_main"]
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_box"]
+albedo_color = Color(0.95, 0.45, 0.12, 1)
+
+[sub_resource type="BoxMesh" id="BoxMesh_box"]
+size = Vector3(1.2, 1.2, 1.2)
+
+[sub_resource type="Environment" id="Environment_main"]
+background_mode = 1
+background_color = Color(0.05, 0.08, 0.16, 1)
+ambient_light_source = 2
+ambient_light_color = Color(0.75, 0.75, 0.75, 1)
+ambient_light_energy = 0.55
+
+[node name="Main" type="Node3D"]
+script = ExtResource("1_main")
+
+[node name="Camera3D" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.2, 2.8)
+current = true
+
+[node name="Mesh" type="MeshInstance3D" parent="."]
+mesh = SubResource("BoxMesh_box")
+material_override = SubResource("StandardMaterial3D_box")
+
+[node name="Light" type="DirectionalLight3D" parent="."]
+shadow_enabled = false
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_main")
+
+[node name="Overlay" type="CanvasLayer" parent="."]
+
+[node name="TwoD" type="ColorRect" parent="Overlay"]
+offset_left = 40.0
+offset_top = 760.0
+offset_right = 440.0
+offset_bottom = 830.0
+mouse_filter = 2
+color = Color(0.1, 0.8, 0.2, 1)
+
+[node name="Report" type="Label" parent="Overlay"]
+offset_left = 16.0
+offset_top = 16.0
+offset_right = 464.0
+offset_bottom = 740.0
+theme_override_colors/font_color = Color(1, 1, 1, 1)
+autowrap_mode = 3
+text = "WeChat acceptance"

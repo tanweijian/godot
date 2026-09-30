@@ -4,6 +4,7 @@ from misc.utility.scons_hints import *
 import json
 import os
 import subprocess
+import sys
 
 Import("env")
 
@@ -138,5 +139,19 @@ def _drop_uncompressed_wasm(target, source, env):
     if os.path.exists(stale):
         os.remove(stale)
 
+def _downlevel_godot_js(target, source, env):
+    sys.path.insert(0, os.path.join(Dir("#").abspath, "platform", "wechat", "tools"))
+    from downlevel_js import downlevel_wechat_js
+
+    path = target[0].abspath
+    with open(path, encoding="utf-8") as handle:
+        source_text = handle.read()
+    rewritten = downlevel_wechat_js(source_text)
+    if rewritten != source_text:
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(rewritten)
+
+
+env.AddPostAction(out_files[0], _downlevel_godot_js)
 env.AddPostAction(installed, _drop_uncompressed_wasm)
 env.NoCache(env.Zip("#bin/godot", installed, ZIPROOT=zip_dir, ZIPSUFFIX="${PROGSUFFIX}${ZIPSUFFIX}"))

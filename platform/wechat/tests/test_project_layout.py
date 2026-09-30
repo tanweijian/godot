@@ -1,4 +1,5 @@
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from project_layout import (
     device_orientation_from_godot,
     host_contract_markers,
     is_valid_appid,
+    measure_written_project,
     plan_network_domains,
     plan_project,
     plan_resource_packages,
@@ -272,6 +274,126 @@ class WeChatProjectLayoutTest(unittest.TestCase):
             self.assertIn(shown, plan["error"])
             self.assertIn(hint, plan["error"].lower() if hint in ("path", "port") else plan["error"])
             self.assertIn("微信公众平台 > 开发 > 开发管理 > 开发设置 > 服务器域名", plan["error"])
+
+    def test_a_written_export_is_measured_against_its_selected_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_bytes(root / "game.js", b"shell")
+            _write_bytes(root / "godot-runtime" / "godot.wasm.br", b"w" * 100)
+            _write_bytes(root / "godot-runtime" / "game.js", b"entry")
+            _write_bytes(root / "groups" / "levels" / "pack.bin", b"p" * 50)
+            _write_bytes(root / "groups" / "levels" / "game.js", b"group")
+            manifest = {
+                "mainPackageLimitBytes": 4 * 1024 * 1024,
+                "totalPackageBudgetBytes": 20 * 1024 * 1024,
+                "mainFiles": ["game.js", "godot.wechat.json"],
+                "runtimeFiles": ["godot-runtime/godot.wasm.br", "godot-runtime/game.js"],
+                "resourceGroups": [
+                    {"name": "levels", "root": "groups/levels/", "pack": "groups/levels/pack.bin"}
+                ],
+            }
+            manifest_bytes = _write_manifest(root, manifest)
+            measured = measure_written_project(root)
+        self.assertEqual(measured["main_bytes"], 5 + manifest_bytes)
+        self.assertEqual(measured["runtime_bytes"], 105)
+        self.assertEqual(measured["group_bytes"], 55)
+        self.assertEqual(measured["total_bytes"], 165 + manifest_bytes)
+        self.assertEqual(measured["main_limit_bytes"], 4194304)
+        self.assertEqual(measured["budget_bytes"], 20971520)
+        self.assertTrue(measured["within_main_limit"])
+        self.assertTrue(measured["within_total_budget"])
+        self.assertEqual(measured["missing"], [])
+        self.assertEqual(measured["unplanned"], [])
+
+    def test_a_leftover_outside_a_subpackage_counts_against_the_main_package_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_bytes(root / "game.js", b"main")
+            _write_bytes(root / "groups" / "old" / "pack.bin", b"leftover!")
+            manifest = _budget_manifest(main_limit=1, budget=20 * 1024 * 1024)
+            manifest_bytes = _fit_manifest_limit(root, manifest, planned_main=4, slack=8)
+            measured = measure_written_project(root)
+        self.assertEqual(measured["main_bytes"], 4 + manifest_bytes + 9)
+        self.assertEqual(measured["unplanned"], ["groups/old/pack.bin"])
+        self.assertEqual(measured["group_bytes"], 0)
+        self.assertGreater(measured["main_bytes"], measured["main_limit_bytes"])
+        self.assertFalse(measured["within_main_limit"])
+
+    def test_a_runtime_subpackage_file_counts_toward_the_total_budget_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_bytes(root / "game.js", b"main")
+            _write_bytes(root / "godot-runtime" / "godot.wasm.br", b"w" * 1000)
+            _write_bytes(root / "godot-runtime" / "extra.bin", b"e" * 50)
+            manifest = _budget_manifest(
+                main_limit=4 * 1024 * 1024,
+                budget=100,
+                runtime_files=["godot-runtime/godot.wasm.br"],
+            )
+            manifest_bytes = _write_manifest(root, manifest)
+            measured = measure_written_project(root)
+        self.assertEqual(measured["main_bytes"], 4 + manifest_bytes)
+        self.assertEqual(measured["runtime_bytes"], 1050)
+        self.assertEqual(measured["unplanned"], ["godot-runtime/extra.bin"])
+        self.assertTrue(measured["within_main_limit"])
+        self.assertGreater(measured["total_bytes"], 100)
+        self.assertFalse(measured["within_total_budget"])
+
+    def test_a_missing_planned_file_is_outside_the_selected_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_bytes(root / "game.js", b"main")
+            _write_manifest(
+                root,
+                _budget_manifest(
+                    main_limit=4 * 1024 * 1024,
+                    budget=20 * 1024 * 1024,
+                    runtime_files=["godot-runtime/godot.wasm.br"],
+                ),
+            )
+            measured = measure_written_project(root)
+        self.assertEqual(measured["missing"], ["godot-runtime/godot.wasm.br"])
+        self.assertFalse(measured["within_main_limit"])
+        self.assertFalse(measured["within_total_budget"])
+
+
+def _budget_manifest(
+    main_limit: int,
+    budget: int,
+    runtime_files: list[str] | None = None,
+    groups: list[dict] | None = None,
+) -> dict:
+    return {
+        "mainPackageLimitBytes": main_limit,
+        "totalPackageBudgetBytes": budget,
+        "mainFiles": ["game.js", "godot.wechat.json"],
+        "runtimeFiles": runtime_files or [],
+        "resourceGroups": groups or [],
+    }
+
+
+def _fit_manifest_limit(root: Path, manifest: dict, planned_main: int, slack: int) -> int:
+    limit = manifest["mainPackageLimitBytes"]
+    manifest_bytes = 0
+    for _ in range(6):
+        manifest["mainPackageLimitBytes"] = limit
+        manifest_bytes = _write_manifest(root, manifest)
+        wanted = planned_main + manifest_bytes + slack
+        if wanted == limit:
+            return manifest_bytes
+        limit = wanted
+    raise AssertionError("manifest limit did not converge")
+
+
+def _write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+def _write_manifest(root: Path, manifest: dict) -> int:
+    payload = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    (root / "godot.wechat.json").write_bytes(payload)
+    return len(payload)
 
 
 if __name__ == "__main__":

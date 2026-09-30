@@ -89,7 +89,11 @@ Error FileAccessUnix::open_internal(const String &p_path, int p_mode_flags) {
 	// write would create a loose file that the pack still shadows on read.
 	if ((p_mode_flags & WRITE) && get_access_type() == ACCESS_RESOURCES) {
 		last_error = ERR_FILE_NO_PERMISSION;
-		ERR_FAIL_V_MSG(ERR_FILE_NO_PERMISSION, vformat("Cannot write \"%s\". Packaged res:// resources are read-only in a WeChat Mini Game.", p_path));
+		// A refused res:// write is the platform rule, not an engine failure.
+		String message = "Cannot write \"" + p_path + "\". ";
+		message += "Packaged res:// resources are read-only in a WeChat Mini Game.";
+		print_line(message);
+		return ERR_FILE_NO_PERMISSION;
 	}
 #endif
 

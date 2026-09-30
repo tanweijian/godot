@@ -518,6 +518,84 @@ def shell_contract_markers() -> list[str]:
     ]
 
 
+def measure_written_project(root: Path) -> dict:
+    """Measure a generated WeChat project against the budget recorded in its manifest.
+
+    Files under a subpackage root count toward the total package only. Every other
+    file, including a leftover from an earlier export, counts toward the main package
+    because WeChat still uploads it there.
+    """
+    manifest_path = Path(root) / "godot.wechat.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    main_limit = int(manifest["mainPackageLimitBytes"])
+    budget = int(manifest["totalPackageBudgetBytes"])
+    main_files = [str(path).replace("\\", "/") for path in manifest.get("mainFiles", [])]
+    runtime_files = [str(path).replace("\\", "/") for path in manifest.get("runtimeFiles", [])]
+    groups = list(manifest.get("resourceGroups", []))
+    planned = set(main_files)
+    planned.update(runtime_files)
+    group_files: list[str] = []
+    runtime_roots: list[str] = []
+    group_roots: list[str] = []
+    for runtime in runtime_files:
+        parent = runtime.rsplit("/", 1)[0] if "/" in runtime else ""
+        if parent and parent not in runtime_roots:
+            runtime_roots.append(parent)
+    for group in groups:
+        pack = str(group["pack"]).replace("\\", "/")
+        root_dir = str(group["root"]).replace("\\", "/")
+        if not root_dir.endswith("/"):
+            root_dir += "/"
+        entry = root_dir + "game.js"
+        group_files.extend([pack, entry])
+        planned.add(pack)
+        planned.add(entry)
+        parent = root_dir.rstrip("/")
+        if parent and parent not in group_roots:
+            group_roots.append(parent)
+
+    present = _relative_files(Path(root))
+    missing = sorted(path for path in [*main_files, *runtime_files, *group_files] if path not in present)
+    unplanned = sorted(path for path in present if path not in planned)
+    subpackage_roots = runtime_roots + group_roots
+
+    def file_bytes(relative: str) -> int:
+        return (Path(root) / relative).stat().st_size
+
+    main_bytes = sum(file_bytes(path) for path in present if not _under_any(path, subpackage_roots))
+    runtime_bytes = sum(file_bytes(path) for path in present if _under_any(path, runtime_roots))
+    group_bytes = sum(file_bytes(path) for path in present if _under_any(path, group_roots))
+    total_bytes = main_bytes + runtime_bytes + group_bytes
+    return {
+        "main_bytes": main_bytes,
+        "runtime_bytes": runtime_bytes,
+        "group_bytes": group_bytes,
+        "total_bytes": total_bytes,
+        "main_limit_bytes": main_limit,
+        "budget_bytes": budget,
+        "within_main_limit": main_bytes <= main_limit and not missing,
+        "within_total_budget": total_bytes <= budget and not missing,
+        "missing": missing,
+        "unplanned": unplanned,
+    }
+
+
+def _relative_files(root: Path) -> list[str]:
+    files = []
+    for path in root.rglob("*"):
+        if path.is_file():
+            files.append(path.relative_to(root).as_posix())
+    return files
+
+
+def _under_any(relative: str, roots: list[str]) -> bool:
+    for root in roots:
+        prefix = root.rstrip("/") + "/"
+        if relative.startswith(prefix):
+            return True
+    return False
+
+
 def host_contract_markers() -> list[str]:
     return [
         "onTouchStart",

@@ -21,19 +21,24 @@ function tick() {
 
 function capture(fn) {
 	const errors = [];
-	const original = console.error;
-	console.error = (...args) => {
+	const originalError = console.error;
+	const originalWarn = console.warn;
+	const record = (...args) => {
 		errors.push(args.map(String).join(" "));
 	};
+	console.error = record;
+	console.warn = record;
 	try {
 		return Promise.resolve()
 			.then(fn)
 			.then((result) => ({ result, errors }))
 			.finally(() => {
-				console.error = original;
+				console.error = originalError;
+				console.warn = originalWarn;
 			});
 	} catch (error) {
-		console.error = original;
+		console.error = originalError;
+		console.warn = originalWarn;
 		throw error;
 	}
 }

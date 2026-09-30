@@ -120,11 +120,25 @@ function readWindowInfo(wx) {
 			console.error("[Godot] wx.getWindowInfo failed: " + error);
 		}
 	}
-	if (typeof wx.getSystemInfoSync !== "function") {
-		return info || {};
-	}
 	if (gotWindow && info.safeArea && info.pixelRatio && info.windowWidth && info.windowHeight) {
 		return info;
+	}
+	if (typeof wx.getDeviceInfo === "function") {
+		try {
+			var device = wx.getDeviceInfo() || {};
+			if (!info.pixelRatio && device.pixelRatio) {
+				info.pixelRatio = device.pixelRatio;
+			}
+			if (!info.system && device.system) {
+				info.system = device.system;
+			}
+		} catch (error) {
+			console.warn("[Godot] wx.getDeviceInfo failed: " + error);
+		}
+	}
+	// Deprecated. WeChat logs "jsbridge not ready" from inside this call.
+	if (wx.getWindowInfo || wx.getDeviceInfo || typeof wx.getSystemInfoSync !== "function") {
+		return info || {};
 	}
 	try {
 		var system = wx.getSystemInfoSync() || {};
@@ -458,7 +472,7 @@ function readAudioEnvironment(wx, root, override) {
 		} catch (error) {
 			console.error("[Godot] wx.getAppBaseInfo failed while reading the audio runtime: " + error);
 		}
-		if (!sdkVersion && typeof wx.getSystemInfoSync === "function") {
+		if (!sdkVersion && !wx.getAppBaseInfo && !wx.getDeviceInfo && typeof wx.getSystemInfoSync === "function") {
 			try {
 				var info = wx.getSystemInfoSync() || {};
 				sdkVersion = info.SDKVersion || "";
@@ -466,7 +480,7 @@ function readAudioEnvironment(wx, root, override) {
 					system = info.system;
 				}
 			} catch (error) {
-				console.error("[Godot] wx.getSystemInfoSync failed while reading the audio runtime: " + error);
+				console.warn("[Godot] wx.getSystemInfoSync failed while reading the audio runtime: " + error);
 			}
 		}
 	}
@@ -2130,7 +2144,7 @@ function wechatFetch(wx, url, init) {
 	return new Promise(function (resolve, reject) {
 		function fail(error) {
 			var message = !wx || typeof wx.request !== "function" ? missingHostMessage("wx.request") : networkFailureMessage("request", url, error);
-			console.error("[Godot] " + message);
+			console.warn("[Godot] " + message);
 			reject(new Error(message));
 		}
 		if (!wx || typeof wx.request !== "function") {
@@ -2213,7 +2227,7 @@ function createWeChatWebSocket(wx) {
 				}
 				closed = true;
 				self.readyState = 3;
-				console.error("[Godot] " + message);
+				console.warn("[Godot] " + message);
 				if (typeof self.onerror === "function") {
 					self.onerror({ type: "error" });
 				}

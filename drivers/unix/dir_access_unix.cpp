@@ -57,7 +57,7 @@ static Error _wechat_resource_mutation_error(DirAccess::AccessType p_access, con
 	if (p_access != DirAccess::ACCESS_RESOURCES) {
 		return OK;
 	}
-	ERR_PRINT(vformat("Cannot modify \"%s\". Packaged res:// resources are read-only in a WeChat Mini Game.", p_path));
+	print_line(vformat("Cannot modify \"%s\". Packaged res:// resources are read-only in a WeChat Mini Game.", p_path));
 	return ERR_FILE_NO_PERMISSION;
 }
 #endif

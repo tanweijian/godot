@@ -131,7 +131,7 @@ def assemble(destination: Path) -> dict:
             "ignoreUploadUnusedFiles": False,
             "useIsolateContext": False,
         },
-        "compileType": "minigame",
+        "compileType": "game",
         "libVersion": "latest",
         "appid": PREVIEW_APPID,
         "projectname": "WeChat Boot",

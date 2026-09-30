@@ -136,30 +136,40 @@ test("missing window info falls back to the 480 by 854 logical viewport", () => 
 	assert.deepEqual(metrics.safeAreaPixels(), { x: 0, y: 0, width: 480, height: 854 });
 });
 
-test("window info prefers getWindowInfo and fills gaps from getSystemInfoSync", () => {
+test("window info does not call getSystemInfoSync when a newer API exists", () => {
+	let called = false;
 	const merged = readWindowInfo({
 		getWindowInfo() {
 			return { windowWidth: 390, windowHeight: 844 };
 		},
+		getDeviceInfo() {
+			return { pixelRatio: 2, system: "iOS 17.5" };
+		},
 		getSystemInfoSync() {
-			return { windowWidth: 100, pixelRatio: 2, safeArea: { left: 0, top: 1, right: 2, bottom: 3 }, screenTop: 4 };
+			called = true;
+			return { windowWidth: 100, pixelRatio: 9 };
 		},
 	});
+	assert.equal(called, false);
 	assert.equal(merged.windowWidth, 390);
 	assert.equal(merged.pixelRatio, 2);
-	assert.equal(merged.safeArea.top, 1);
-	assert.equal(merged.screenTop, 4);
+	assert.equal(merged.system, "iOS 17.5");
 
-	const fallback = readWindowInfo({
-		getWindowInfo() {
-			throw new Error("unavailable");
-		},
+	const legacy = readWindowInfo({
 		getSystemInfoSync() {
-			return { windowWidth: 11, windowHeight: 22, pixelRatio: 1 };
+			return {
+				windowWidth: 11,
+				windowHeight: 22,
+				pixelRatio: 1,
+				safeArea: { left: 0, top: 1, right: 2, bottom: 3 },
+				screenTop: 4,
+			};
 		},
 	});
-	assert.equal(fallback.windowWidth, 11);
-	assert.equal(fallback.windowHeight, 22);
+	assert.equal(legacy.windowWidth, 11);
+	assert.equal(legacy.windowHeight, 22);
+	assert.equal(legacy.safeArea.top, 1);
+	assert.equal(legacy.screenTop, 4);
 });
 
 test("hiding pauses once and showing resumes without replacing the runtime", () => {

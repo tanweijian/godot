@@ -87,6 +87,45 @@ function godotWeChatCompareVersion(left, right) {
 	return 0;
 }
 
+function godotWeChatEnsureEntropy() {
+	var root = godotWeChatRoot();
+	var native = null;
+	try {
+		native = root.crypto && root.crypto.getRandomValues;
+	} catch (error) {
+		native = null;
+	}
+	function fill(view) {
+		if (native) {
+			try {
+				return native.call(root.crypto, view);
+			} catch (error) {
+				native = null;
+			}
+		}
+		var i;
+		for (i = 0; i < view.length; i++) {
+			view[i] = Math.floor(Math.random() * 256);
+		}
+		return view;
+	}
+	var cryptoObject = { getRandomValues: fill };
+	var targets = [root];
+	if (typeof globalThis !== "undefined") {
+		targets.push(globalThis);
+	}
+	var i;
+	for (i = 0; i < targets.length; i++) {
+		try {
+			if (!targets[i].crypto || typeof targets[i].crypto.getRandomValues !== "function") {
+				targets[i].crypto = cryptoObject;
+			}
+		} catch (error) {
+			console.warn("[Godot] could not install a crypto.getRandomValues fallback: " + error);
+		}
+	}
+}
+
 function godotWeChatSdkVersion() {
 	try {
 		if (wx.getAppBaseInfo) {
@@ -96,7 +135,12 @@ function godotWeChatSdkVersion() {
 			}
 		}
 	} catch (error) {
-		console.error("[Godot] wx.getAppBaseInfo failed: " + error);
+		console.warn("[Godot] wx.getAppBaseInfo failed: " + error);
+	}
+	// getSystemInfoSync logs "jsbridge not ready" from inside WeChat. Use it only
+	// when the current base library has no replacement.
+	if (wx.getAppBaseInfo || wx.getDeviceInfo) {
+		return "";
 	}
 	try {
 		if (wx.getSystemInfoSync) {
@@ -106,7 +150,7 @@ function godotWeChatSdkVersion() {
 			}
 		}
 	} catch (error) {
-		console.error("[Godot] wx.getSystemInfoSync failed: " + error);
+		console.warn("[Godot] wx.getSystemInfoSync failed: " + error);
 	}
 	return "";
 }
@@ -152,11 +196,15 @@ function godotWeChatProbeWebGL2() {
 	}
 	var environment = {};
 	try {
-		if (wx.getSystemInfoSync) {
+		if (wx.getDeviceInfo) {
+			environment = wx.getDeviceInfo() || {};
+		} else if (wx.getAppBaseInfo) {
+			environment = wx.getAppBaseInfo() || {};
+		} else if (!wx.getWindowInfo && wx.getSystemInfoSync) {
 			environment = wx.getSystemInfoSync() || {};
 		}
 	} catch (error) {
-		console.error("[Godot] wx.getSystemInfoSync failed: " + error);
+		console.warn("[Godot] reading the device environment failed: " + error);
 	}
 	var report = WeChatHost.probeCompatibility3D(context, environment);
 	godotWeChatReleaseProbeContext(context);
@@ -297,6 +345,7 @@ function godotWeChatStartEngine() {
 		return Promise.reject(new Error("WebAssembly is not available"));
 	}
 	godotWeChatEnsureDocument();
+	godotWeChatEnsureEntropy();
 	var factory = require(GODOT_JS_PATH);
 	if (factory && factory.default) {
 		factory = factory.default;

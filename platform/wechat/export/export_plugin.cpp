@@ -201,7 +201,7 @@ String _project_config(const String &p_appid, const String &p_project_name, bool
 	config["description"] = "Godot WeChat Mini Game";
 	config["packOptions"] = pack_options;
 	config["setting"] = setting;
-	config["compileType"] = "minigame";
+	config["compileType"] = "game";
 	config["libVersion"] = "latest";
 	config["appid"] = p_appid;
 	config["projectname"] = p_project_name;
